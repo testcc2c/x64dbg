@@ -1,5 +1,7 @@
+#include <QVBoxLayout>
 #include "CommandHelpView.h"
 #include "ui_CommandHelpView.h"
+#include "SearchListView.h"
 
 CommandHelpView::CommandHelpView(QWidget* parent) : QWidget(parent), ui(new Ui::CommandHelpView)
 {
@@ -14,7 +16,7 @@ CommandHelpView::CommandHelpView(QWidget* parent) : QWidget(parent), ui(new Ui::
     setLayout(mMainLayout);
 
     // Create reference view
-    mSearchListView = new SearchListView();
+    mSearchListView = new SearchListView(true, this);
     mSearchListView->mSearchStartCol = 1;
 
     // Get font information
@@ -25,13 +27,13 @@ CommandHelpView::CommandHelpView(QWidget* parent) : QWidget(parent), ui(new Ui::
 
     // Create module list
     mModuleList = new StdTable();
-    mModuleList->addColumnAt(0, "Module", false);
+    mModuleList->addColumnAt(0, tr("Module"), false);
 
     // Setup symbol list
-    mSearchListView->mList->addColumnAt(0, "Command", true);
+    mSearchListView->mList->addColumnAt(0, tr("Command"), true);
 
     // Setup search list
-    mSearchListView->mSearchList->addColumnAt(0, "Command", true);
+    mSearchListView->mSearchList->addColumnAt(0, tr("Command"), true);
 
     // Setup list splitter
     ui->listSplitter->addWidget(mModuleList);
@@ -106,13 +108,13 @@ void CommandHelpView::symbolSelectionChanged(int index)
         switch(index)
         {
         case 0: //InitDebug
-            info = "Initialize debugging a file.\n\nExample:\nInitDebug \"C:\\test.exe\", commandline, \"C:\\homeDir\"";
+            info = tr("Initialize debugging a file.\n\nExample:\nInitDebug \"C:\\test.exe\", commandline, \"C:\\homeDir\"");
             break;
         case 1: //StopDebug
-            info = "Stop debugging (terminate the target).\n\nExample:\nStopDebug";
+            info = tr("Stop debugging (terminate the target).\n\nExample:\nStopDebug");
             break;
         case 2: //run
-            info = "Resume debugging.\n\nExample:\nrun";
+            info = tr("Resume debugging.\n\nExample:\nrun");
             break;
         }
     }

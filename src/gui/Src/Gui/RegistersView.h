@@ -8,9 +8,12 @@
 
 #define IsCharacterRegister(x) ((x>=CAX && x<CIP))
 
+class CPUWidget;
+class CPUMultiDump;
+
 typedef struct
 {
-    QString string;
+    const char* string;
     unsigned int value;
 } STRING_VALUE_TABLE_t;
 
@@ -18,7 +21,7 @@ typedef struct
 
 namespace Ui
 {
-class RegistersView;
+    class RegistersView;
 }
 
 class RegistersView : public QScrollArea
@@ -64,6 +67,22 @@ public:
         UNKNOWN
     };
 
+    enum SIMD_REG_DISP_MODE
+    {
+        SIMD_REG_DISP_HEX,
+        SIMD_REG_DISP_FLOAT,
+        SIMD_REG_DISP_DOUBLE,
+        SIMD_REG_DISP_WORD_SIGNED,
+        SIMD_REG_DISP_DWORD_SIGNED,
+        SIMD_REG_DISP_QWORD_SIGNED,
+        SIMD_REG_DISP_WORD_UNSIGNED,
+        SIMD_REG_DISP_DWORD_UNSIGNED,
+        SIMD_REG_DISP_QWORD_UNSIGNED,
+        SIMD_REG_DISP_WORD_HEX,
+        SIMD_REG_DISP_DWORD_HEX,
+        SIMD_REG_DISP_QWORD_HEX
+    };
+
     // contains viewport position of register
     struct Register_Position
     {
@@ -89,13 +108,14 @@ public:
     };
 
 
-    explicit RegistersView(QWidget* parent = 0);
+    explicit RegistersView(CPUWidget* parent, CPUMultiDump* multiDump);
     ~RegistersView();
 
     QSize sizeHint() const;
 
     static void* operator new(size_t size);
     static void operator delete(void* p);
+    int getEstimateHeight();
 
 public slots:
     void refreshShortcutsSlot();
@@ -103,10 +123,11 @@ public slots:
     void displayCustomContextMenuSlot(QPoint pos);
     void setRegister(REGISTER_NAME reg, duint value);
     void debugStateChangedSlot(DBGSTATE state);
-    void repaint();
+    void reload();
     void ShowFPU(bool set_showfpu);
     void onChangeFPUViewAction();
     void SetChangeButton(QPushButton* push_button);
+
 signals:
     void refresh();
 
@@ -114,6 +135,7 @@ protected:
     // events
     virtual void mousePressEvent(QMouseEvent* event);
     virtual void mouseDoubleClickEvent(QMouseEvent* event);
+    virtual void mouseMoveEvent(QMouseEvent* event);
     virtual void paintEvent(QPaintEvent* event);
     virtual void keyPressEvent(QKeyEvent* event);
 
@@ -122,6 +144,8 @@ protected:
     void setRegisters(REGDUMP* reg);
     char* registerValue(const REGDUMP* regd, const REGISTER_NAME reg);
     bool identifyRegister(const int y, const int x, REGISTER_NAME* clickedReg);
+    QString helpRegister(REGISTER_NAME reg);
+    QMenu* CreateDumpNMenu(CPUMultiDump* multiDump);
 
     void displayEditDialog();
 
@@ -135,30 +159,55 @@ protected slots:
     void onSetToOneAction();
     void onModifyAction();
     void onToggleValueAction();
+    void onUndoAction();
     void onCopyToClipboardAction();
     void onCopySymbolToClipboardAction();
+    void onCopyAllAction();
     void onFollowInDisassembly();
     void onFollowInDump();
+    void onFollowInDumpN();
     void onFollowInStack();
+    void onFollowInMemoryMap();
+    void onIncrementPtrSize();
+    void onDecrementPtrSize();
+    void onPushAction();
+    void onPopAction();
+    void onHighlightSlot();
     void InitMappings();
+    // switch SIMD display modes
+    void onSIMDHex();
+    void onSIMDFloat();
+    void onSIMDDouble();
+    void onSIMDSWord();
+    void onSIMDUWord();
+    void onSIMDHWord();
+    void onSIMDSDWord();
+    void onSIMDUDWord();
+    void onSIMDHDWord();
+    void onSIMDSQWord();
+    void onSIMDUQWord();
+    void onSIMDHQWord();
+    void onClose();
     QString getRegisterLabel(REGISTER_NAME);
     int CompareRegisters(const REGISTER_NAME reg_name, REGDUMP* regdump1, REGDUMP* regdump2);
     SIZE_T GetSizeRegister(const REGISTER_NAME reg_name);
-    QString GetRegStringValueFromValue(REGISTER_NAME reg , char* value);
+    QString GetRegStringValueFromValue(REGISTER_NAME reg, const char* value);
     QString GetTagWordStateString(unsigned short);
-    unsigned int GetTagWordValueFromString(QString string);
+    //unsigned int GetTagWordValueFromString(const char* string);
     QString GetControlWordPCStateString(unsigned short);
-    unsigned int GetControlWordPCValueFromString(QString string);
+    //unsigned int GetControlWordPCValueFromString(const char* string);
     QString GetControlWordRCStateString(unsigned short);
-    unsigned int GetControlWordRCValueFromString(QString string);
+    //unsigned int GetControlWordRCValueFromString(const char* string);
     QString GetMxCsrRCStateString(unsigned short);
-    unsigned int GetMxCsrRCValueFromString(QString string);
-    void ModifyFields(QString title, STRING_VALUE_TABLE_t* table, SIZE_T size);
-    unsigned int GetStatusWordTOPValueFromString(QString string);
+    //unsigned int GetMxCsrRCValueFromString(const char* string);
+    void ModifyFields(const QString & title, STRING_VALUE_TABLE_t* table, SIZE_T size);
+    //unsigned int GetStatusWordTOPValueFromString(const char* string);
     QString GetStatusWordTOPStateString(unsigned short state);
-
+    void appendRegister(QString & text, REGISTER_NAME reg, const char* name64, const char* name32);
+    void disasmSelectionChangedSlot(dsint va);
 private:
     QPushButton* mChangeViewButton;
+    CPUWidget* mParent;
     bool mShowFpu;
     int mVScrollOffset;
     int mRowsNeeded;
@@ -170,11 +219,13 @@ private:
     QSet<REGISTER_NAME> mBOOLDISPLAY;
     QSet<REGISTER_NAME> mLABELDISPLAY;
     QSet<REGISTER_NAME> mONLYMODULEANDLABELDISPLAY;
+    QSet<REGISTER_NAME> mUNDODISPLAY;
     QSet<REGISTER_NAME> mSETONEZEROTOGGLE;
     QSet<REGISTER_NAME> mMODIFYDISPLAY;
     QSet<REGISTER_NAME> mFIELDVALUE;
     QSet<REGISTER_NAME> mTAGWORD;
     QSet<REGISTER_NAME> mCANSTOREADDRESS;
+    QSet<REGISTER_NAME> mSEGMENTREGISTER;
     QSet<REGISTER_NAME> mINCREMENTDECREMET;
     QSet<REGISTER_NAME> mFPUx87_80BITSDISPLAY;
     QSet<REGISTER_NAME> mFPU;
@@ -202,22 +253,48 @@ private:
     REGDUMP wCipRegDumpStruct;
     // font measures (TODO: create a class that calculates all thos values)
     unsigned int mRowHeight, mCharWidth;
+    // SIMD registers display mode
+    SIMD_REG_DISP_MODE wSIMDRegDispMode;
     // context menu actions
+    QMenu* mFollowInDumpMenu;
+    QMenu* mSwitchSIMDDispMode;
+    QAction* mFollowInDump;
     QAction* wCM_Increment;
     QAction* wCM_Decrement;
+    QAction* wCM_IncrementPtrSize;
+    QAction* wCM_DecrementPtrSize;
+    QAction* wCM_Push;
+    QAction* wCM_Pop;
     QAction* wCM_Zero;
     QAction* wCM_SetToOne;
     QAction* wCM_Modify;
     QAction* wCM_ToggleValue;
+    QAction* wCM_Undo;
     QAction* wCM_CopyToClipboard;
     QAction* wCM_CopySymbolToClipboard;
+    QAction* wCM_CopyAll;
     QAction* wCM_FollowInDisassembly;
     QAction* wCM_FollowInDump;
     QAction* wCM_FollowInStack;
+    QAction* wCM_FollowInMemoryMap;
     QAction* wCM_Incrementx87Stack;
     QAction* wCM_Decrementx87Stack;
     QAction* wCM_ChangeFPUView;
+    QAction* wCM_Highlight;
+    QAction* SIMDHex;
+    QAction* SIMDFloat;
+    QAction* SIMDDouble;
+    QAction* SIMDSWord;
+    QAction* SIMDUWord;
+    QAction* SIMDHWord;
+    QAction* SIMDSDWord;
+    QAction* SIMDUDWord;
+    QAction* SIMDHDWord;
+    QAction* SIMDSQWord;
+    QAction* SIMDUQWord;
+    QAction* SIMDHQWord;
     dsint mCip;
+    std::vector<std::pair<const char*, uint8_t>> mHighlightRegs;
 };
 
 #endif // REGISTERSVIEW_H

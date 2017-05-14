@@ -10,6 +10,8 @@
 #include "threading.h"
 #include "thread.h"
 #include "module.h"
+#include "taskthread.h"
+#include "value.h"
 
 #define PAGE_SHIFT              (12)
 //#define PAGE_SIZE               (4096)
@@ -17,6 +19,7 @@
 #define BYTES_TO_PAGES(Size)    (((Size) >> PAGE_SHIFT) + (((Size) & (PAGE_SIZE - 1)) != 0))
 #define ROUND_TO_PAGES(Size)    (((ULONG_PTR)(Size) + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1))
 
+static ULONG fallbackCookie = 0;
 std::map<Range, MEMPAGE, RangeCompare> memoryPages;
 bool bListAllPages = false;
 
@@ -24,6 +27,7 @@ void MemUpdateMap()
 {
     // First gather all possible pages in the memory range
     std::vector<MEMPAGE> pageVector;
+    pageVector.reserve(200); //TODO: provide a better estimate
     {
         SIZE_T numBytes = 0;
         duint pageStart = 0;
@@ -37,31 +41,56 @@ void MemUpdateMap()
 
             numBytes = VirtualQueryEx(fdProcessInfo->hProcess, (LPVOID)pageStart, &mbi, sizeof(mbi));
 
-            // Only allow pages that are committed to memory (exclude reserved/mapped)
-            if(mbi.State == MEM_COMMIT)
+            // Only allow pages that are committed/reserved (exclude free memory)
+            if(mbi.State != MEM_FREE)
             {
+                auto bReserved = mbi.State == MEM_RESERVE; //check if the current page is reserved.
+                auto bPrevReserved = pageVector.size() ? pageVector.back().mbi.State == MEM_RESERVE : false; //back if the previous page was reserved (meaning this one won't be so it has to be added to the map)
                 // Only list allocation bases, unless if forced to list all
-                if(bListAllPages || allocationBase != (duint)mbi.AllocationBase)
+                if(bListAllPages || bReserved || bPrevReserved || allocationBase != duint(mbi.AllocationBase))
                 {
                     // Set the new allocation base page
-                    allocationBase = (duint)mbi.AllocationBase;
+                    allocationBase = duint(mbi.AllocationBase);
 
                     MEMPAGE curPage;
                     memset(&curPage, 0, sizeof(MEMPAGE));
                     memcpy(&curPage.mbi, &mbi, sizeof(mbi));
 
-                    ModNameFromAddr(pageStart, curPage.info, true);
+                    if(bReserved)
+                    {
+                        if(duint(curPage.mbi.BaseAddress) != allocationBase)
+                            sprintf_s(curPage.info, GuiTranslateText(QT_TRANSLATE_NOOP("DBG", "Reserved (%p)")), allocationBase);
+                        else
+                            strcpy_s(curPage.info, GuiTranslateText(QT_TRANSLATE_NOOP("DBG", "Reserved")));
+                    }
+                    else if(!ModNameFromAddr(pageStart, curPage.info, true))
+                    {
+                        // Module lookup failed; check if it's a file mapping
+                        wchar_t szMappedName[sizeof(curPage.info)] = L"";
+                        if((mbi.Type == MEM_MAPPED) &&
+                                (GetMappedFileNameW(fdProcessInfo->hProcess, mbi.AllocationBase, szMappedName, MAX_MODULE_SIZE) != 0))
+                        {
+                            auto bFileNameOnly = false; //TODO: setting for this
+                            auto fileStart = wcsrchr(szMappedName, L'\\');
+                            if(bFileNameOnly && fileStart)
+                                strcpy_s(curPage.info, StringUtils::Utf16ToUtf8(fileStart + 1).c_str());
+                            else
+                                strcpy_s(curPage.info, StringUtils::Utf16ToUtf8(szMappedName).c_str());
+                        }
+                    }
+
                     pageVector.push_back(curPage);
                 }
                 else
                 {
                     // Otherwise append the page to the last created entry
-                    pageVector.back().mbi.RegionSize += mbi.RegionSize;
+                    if(pageVector.size()) //make sure to not dereference an invalid pointer
+                        pageVector.back().mbi.RegionSize += mbi.RegionSize;
                 }
             }
 
             // Calculate the next page start
-            duint newAddress = (duint)mbi.BaseAddress + mbi.RegionSize;
+            duint newAddress = duint(mbi.BaseAddress) + mbi.RegionSize;
 
             if(newAddress <= pageStart)
                 break;
@@ -77,19 +106,19 @@ void MemUpdateMap()
     for(int i = pagecount - 1; i > -1; i--)
     {
         auto & currentPage = pageVector.at(i);
-        if(!currentPage.info[0] || (scmp(curMod, currentPage.info) && !bListAllPages))   //there is a module
+        if(!currentPage.info[0] || (scmp(curMod, currentPage.info) && !bListAllPages)) //there is a module
             continue; //skip non-modules
         strcpy(curMod, pageVector.at(i).info);
-        duint base = ModBaseFromName(currentPage.info);
-        if(!base)
+        if(!ModBaseFromName(currentPage.info))
             continue;
+        auto base = duint(currentPage.mbi.AllocationBase);
         std::vector<MODSECTIONINFO> sections;
         if(!ModSectionsFromAddr(base, &sections))
             continue;
         int SectionNumber = (int)sections.size();
-        if(!SectionNumber)  //no sections = skip
+        if(!SectionNumber) //no sections = skip
             continue;
-        if(!bListAllPages)  //normal view
+        if(!bListAllPages) //normal view
         {
             MEMPAGE newPage;
             //remove the current module page (page = size of module at this point) and insert the module sections
@@ -100,7 +129,7 @@ void MemUpdateMap()
                 memset(&newPage, 0, sizeof(MEMPAGE));
                 VirtualQueryEx(fdProcessInfo->hProcess, (LPCVOID)currentSection.addr, &newPage.mbi, sizeof(MEMORY_BASIC_INFORMATION));
                 duint SectionSize = currentSection.size;
-                if(SectionSize % PAGE_SIZE)  //unaligned page size
+                if(SectionSize % PAGE_SIZE) //unaligned page size
                     SectionSize += PAGE_SIZE - (SectionSize % PAGE_SIZE); //fix this
                 if(SectionSize)
                     newPage.mbi.RegionSize = SectionSize;
@@ -122,16 +151,16 @@ void MemUpdateMap()
                 const auto & currentSection = sections.at(j);
                 duint secStart = currentSection.addr;
                 duint SectionSize = currentSection.size;
-                if(SectionSize % PAGE_SIZE)  //unaligned page size
+                if(SectionSize % PAGE_SIZE) //unaligned page size
                     SectionSize += PAGE_SIZE - (SectionSize % PAGE_SIZE); //fix this
                 duint secEnd = secStart + SectionSize;
-                if(secStart >= start && secEnd <= end)  //section is inside the memory page
+                if(secStart >= start && secEnd <= end) //section is inside the memory page
                 {
                     if(k)
                         k += sprintf_s(currentPage.info + k, MAX_MODULE_SIZE - k, ",");
                     k += sprintf_s(currentPage.info + k, MAX_MODULE_SIZE - k, " \"%s\"", currentSection.name);
                 }
-                else if(start >= secStart && end <= secEnd)  //memory page is inside the section
+                else if(start >= secStart && end <= secEnd) //memory page is inside the section
                 {
                     if(k)
                         k += sprintf_s(currentPage.info + k, MAX_MODULE_SIZE - k, ",");
@@ -145,46 +174,63 @@ void MemUpdateMap()
     THREADLIST threadList;
     ThreadGetList(&threadList);
 
-    for (auto & page : pageVector)
+    for(auto & page : pageVector)
     {
         const duint pageBase = (duint)page.mbi.BaseAddress;
         const duint pageSize = (duint)page.mbi.RegionSize;
 
         // Check for windows specific data
-        if (pageBase == 0x7FFE0000)
+        if(pageBase == 0x7FFE0000)
         {
             strcpy_s(page.info, "KUSER_SHARED_DATA");
             continue;
         }
 
         // Check in threads
-        for (int i = 0; i < threadList.count; i++)
+        for(int i = 0; i < threadList.count; i++)
         {
-            duint tebBase = threadList.list[i].BasicInfo.ThreadLocalBase;
             DWORD threadId = threadList.list[i].BasicInfo.ThreadId;
 
             // Mark TEB
-            if (pageBase == tebBase)
+            //
+            // TebBase:      Points to 32/64 TEB
+            // TebBaseWow64: Points to 64 TEB in a 32bit process
+            duint tebBase = threadList.list[i].BasicInfo.ThreadLocalBase;
+            duint tebBaseWow64 = tebBase - (2 * PAGE_SIZE);
+
+            if(pageBase == tebBase)
             {
-                sprintf_s(page.info, "Thread %X TEB", threadId);
+                sprintf_s(page.info, GuiTranslateText(QT_TRANSLATE_NOOP("DBG", "Thread %X TEB")), threadId);
                 break;
             }
+            else if(pageBase == tebBaseWow64)
+            {
+#ifndef _WIN64
+                if(pageSize == (3 * PAGE_SIZE))
+                {
+                    sprintf_s(page.info, GuiTranslateText(QT_TRANSLATE_NOOP("DBG", "Thread %X WoW64 TEB")), threadId);
+                    break;
+                }
+#endif // ndef _WIN64
+            }
 
-            // Read the TEB to get stack information
-            TEB teb;
-            if (!ThreadGetTeb(tebBase, &teb))
+            // Mark stack
+            //
+            // Read TEB::Tib to get stack information
+            NT_TIB tib;
+            if(!ThreadGetTib(tebBase, &tib))
                 continue;
 
             // The stack will be a specific range only, not always the base address
-            duint stackAddr = (duint)teb.Tib.StackLimit;
+            duint stackAddr = (duint)tib.StackLimit;
 
-            if (stackAddr >= pageBase && stackAddr < (pageBase + pageSize))
-                sprintf_s(page.info, "Thread %X Stack", threadId);
+            if(stackAddr >= pageBase && stackAddr < (pageBase + pageSize))
+                sprintf_s(page.info, GuiTranslateText(QT_TRANSLATE_NOOP("DBG", "Thread %X Stack")), threadId);
         }
     }
 
     // Only free thread data if it was allocated
-    if (threadList.list)
+    if(threadList.list)
         BridgeFree(threadList.list);
 
     // Convert the vector to a map
@@ -199,7 +245,23 @@ void MemUpdateMap()
     }
 }
 
-duint MemFindBaseAddr(duint Address, duint* Size, bool Refresh)
+static DWORD WINAPI memUpdateMap()
+{
+    if(DbgIsDebugging())
+    {
+        MemUpdateMap();
+        GuiUpdateMemoryView();
+    }
+    return 0;
+}
+
+void MemUpdateMapAsync()
+{
+    static TaskThread_<decltype(&memUpdateMap)> memUpdateMapTask(&memUpdateMap, 1000);
+    memUpdateMapTask.WakeUp();
+}
+
+duint MemFindBaseAddr(duint Address, duint* Size, bool Refresh, bool FindReserved)
 {
     // Update the memory map if needed
     if(Refresh)
@@ -213,6 +275,9 @@ duint MemFindBaseAddr(duint Address, duint* Size, bool Refresh)
     if(found == memoryPages.end())
         return 0;
 
+    if(!FindReserved && found->second.mbi.State == MEM_RESERVE) //check if the current page is reserved.
+        return 0;
+
     // Return the allocation region size when requested
     if(Size)
         *Size = found->second.mbi.RegionSize;
@@ -220,58 +285,72 @@ duint MemFindBaseAddr(duint Address, duint* Size, bool Refresh)
     return found->first.first;
 }
 
-bool MemRead(duint BaseAddress, void* Buffer, duint Size, duint* NumberOfBytesRead)
+static bool MemoryReadSafePage(HANDLE hProcess, LPVOID lpBaseAddress, LPVOID lpBuffer, SIZE_T nSize, SIZE_T* lpNumberOfBytesRead)
+{
+    //TODO: remove when proven stable, this function checks if reads are always within page boundaries
+    auto base = duint(lpBaseAddress);
+    if(nSize > PAGE_SIZE - (base & (PAGE_SIZE - 1)))
+        __debugbreak();
+    return MemoryReadSafe(hProcess, lpBaseAddress, lpBuffer, nSize, lpNumberOfBytesRead);
+}
+
+bool MemRead(duint BaseAddress, void* Buffer, duint Size, duint* NumberOfBytesRead, bool cache)
 {
     if(!MemIsCanonicalAddress(BaseAddress))
         return false;
 
-    // Buffer must be supplied and size must be greater than 0
-    if(!Buffer || Size <= 0)
+    if(cache && !MemIsValidReadPtr(BaseAddress, cache))
         return false;
 
-    // If the 'bytes read' parameter is null, use a temp
-    SIZE_T bytesReadTemp = 0;
+    if(!Buffer || !Size)
+        return false;
 
+    duint bytesReadTemp = 0;
     if(!NumberOfBytesRead)
         NumberOfBytesRead = &bytesReadTemp;
 
-    // Normal single-call read
-    bool ret = MemoryReadSafe(fdProcessInfo->hProcess, (LPVOID)BaseAddress, Buffer, Size, NumberOfBytesRead);
+    duint offset = 0;
+    duint requestedSize = Size;
+    duint sizeLeftInFirstPage = PAGE_SIZE - (BaseAddress & (PAGE_SIZE - 1));
+    duint readSize = min(sizeLeftInFirstPage, requestedSize);
 
-    if(ret && *NumberOfBytesRead == Size)
-        return true;
-
-    // Read page-by-page (Skip if only 1 page exists)
-    // If (SIZE > PAGE_SIZE) or (ADDRESS exceeds boundary), multiple reads will be needed
-    SIZE_T pageCount = BYTES_TO_PAGES(Size);
-
-    if(pageCount > 1)
+    while(readSize)
     {
-        // Determine the number of bytes between ADDRESS and the next page
-        duint offset = 0;
-        duint readBase = BaseAddress;
-        duint readSize = ROUND_TO_PAGES(readBase) - readBase;
+        SIZE_T bytesRead = 0;
+        auto readSuccess = MemoryReadSafePage(fdProcessInfo->hProcess, (PVOID)(BaseAddress + offset), (PBYTE)Buffer + offset, readSize, &bytesRead);
+        *NumberOfBytesRead += bytesRead;
+        if(!readSuccess)
+            break;
 
-        // Reset the bytes read count
-        *NumberOfBytesRead = 0;
+        offset += readSize;
+        requestedSize -= readSize;
+        readSize = min(PAGE_SIZE, requestedSize);
 
-        for(SIZE_T i = 0; i < pageCount; i++)
-        {
-            SIZE_T bytesRead = 0;
-
-            if(MemoryReadSafe(fdProcessInfo->hProcess, (PVOID)readBase, ((PBYTE)Buffer + offset), readSize, &bytesRead))
-                *NumberOfBytesRead += bytesRead;
-
-            offset += readSize;
-            readBase += readSize;
-
-            Size -= readSize;
-            readSize = min(PAGE_SIZE, Size);
-        }
+        if(readSize && (BaseAddress + offset) % PAGE_SIZE)
+            __debugbreak(); //TODO: remove when proven stable, this checks if (BaseAddress + offset) is aligned to PAGE_SIZE after the first call
     }
 
-    SetLastError(ERROR_PARTIAL_COPY);
-    return (*NumberOfBytesRead > 0);
+    auto success = *NumberOfBytesRead == Size;
+    SetLastError(success ? ERROR_SUCCESS : ERROR_PARTIAL_COPY);
+    return success;
+}
+
+bool MemReadUnsafe(duint BaseAddress, void* Buffer, duint Size, duint* NumberOfBytesRead)
+{
+    SIZE_T read = 0;
+    auto result = !!ReadProcessMemory(fdProcessInfo->hProcess, LPCVOID(BaseAddress), Buffer, Size, &read);
+    if(NumberOfBytesRead)
+        *NumberOfBytesRead = read;
+    return result;
+}
+
+static bool MemoryWriteSafePage(HANDLE hProcess, LPVOID lpBaseAddress, LPCVOID lpBuffer, SIZE_T nSize, SIZE_T* lpNumberOfBytesWritten)
+{
+    //TODO: remove when proven stable, this function checks if writes are always within page boundaries
+    auto base = duint(lpBaseAddress);
+    if(nSize > PAGE_SIZE - (base & (PAGE_SIZE - 1)))
+        __debugbreak();
+    return MemoryWriteSafe(hProcess, lpBaseAddress, lpBuffer, nSize, lpNumberOfBytesWritten);
 }
 
 bool MemWrite(duint BaseAddress, const void* Buffer, duint Size, duint* NumberOfBytesWritten)
@@ -279,53 +358,37 @@ bool MemWrite(duint BaseAddress, const void* Buffer, duint Size, duint* NumberOf
     if(!MemIsCanonicalAddress(BaseAddress))
         return false;
 
-    // Buffer must be supplied and size must be greater than 0
-    if(!Buffer || Size <= 0)
+    if(!Buffer || !Size)
         return false;
 
-    // If the 'bytes written' parameter is null, use a temp
     SIZE_T bytesWrittenTemp = 0;
-
     if(!NumberOfBytesWritten)
         NumberOfBytesWritten = &bytesWrittenTemp;
 
-    // Try a regular WriteProcessMemory call
-    bool ret = MemoryWriteSafe(fdProcessInfo->hProcess, (LPVOID)BaseAddress, Buffer, Size, NumberOfBytesWritten);
+    duint offset = 0;
+    duint requestedSize = Size;
+    duint sizeLeftInFirstPage = PAGE_SIZE - (BaseAddress & (PAGE_SIZE - 1));
+    duint writeSize = min(sizeLeftInFirstPage, requestedSize);
 
-    if(ret && *NumberOfBytesWritten == Size)
-        return true;
-
-    // Write page-by-page (Skip if only 1 page exists)
-    // See: MemRead
-    SIZE_T pageCount = BYTES_TO_PAGES(Size);
-
-    if(pageCount > 1)
+    while(writeSize)
     {
-        // Determine the number of bytes between ADDRESS and the next page
-        duint offset = 0;
-        duint writeBase = BaseAddress;
-        duint writeSize = ROUND_TO_PAGES(writeBase) - writeBase;
+        SIZE_T bytesWritten = 0;
+        auto writeSuccess = MemoryWriteSafePage(fdProcessInfo->hProcess, (PVOID)(BaseAddress + offset), (PBYTE)Buffer + offset, writeSize, &bytesWritten);
+        *NumberOfBytesWritten += bytesWritten;
+        if(!writeSuccess)
+            break;
 
-        // Reset the bytes read count
-        *NumberOfBytesWritten = 0;
+        offset += writeSize;
+        requestedSize -= writeSize;
+        writeSize = min(PAGE_SIZE, requestedSize);
 
-        for(SIZE_T i = 0; i < pageCount; i++)
-        {
-            SIZE_T bytesWritten = 0;
-
-            if(MemoryWriteSafe(fdProcessInfo->hProcess, (PVOID)writeBase, ((PBYTE)Buffer + offset), writeSize, &bytesWritten))
-                *NumberOfBytesWritten += bytesWritten;
-
-            offset += writeSize;
-            writeBase += writeSize;
-
-            Size -= writeSize;
-            writeSize = min(PAGE_SIZE, Size);
-        }
+        if(writeSize && (BaseAddress + offset) % PAGE_SIZE)
+            __debugbreak(); //TODO: remove when proven stable, this checks if (BaseAddress + offset) is aligned to PAGE_SIZE after the first call
     }
 
-    SetLastError(ERROR_PARTIAL_COPY);
-    return (*NumberOfBytesWritten > 0);
+    auto success = *NumberOfBytesWritten == Size;
+    SetLastError(success ? ERROR_SUCCESS : ERROR_PARTIAL_COPY);
+    return success;
 }
 
 bool MemPatch(duint BaseAddress, const void* Buffer, duint Size, duint* NumberOfBytesWritten)
@@ -345,9 +408,9 @@ bool MemPatch(duint BaseAddress, const void* Buffer, duint Size, duint* NumberOf
     }
 
     // Are we able to write on this page?
-    if (MemWrite(BaseAddress, Buffer, Size, NumberOfBytesWritten))
+    if(MemWrite(BaseAddress, Buffer, Size, NumberOfBytesWritten))
     {
-        for (duint i = 0; i < Size; i++)
+        for(duint i = 0; i < Size; i++)
             PatchSet(BaseAddress + i, oldData()[i], ((const unsigned char*)Buffer)[i]);
 
         // Done
@@ -358,10 +421,20 @@ bool MemPatch(duint BaseAddress, const void* Buffer, duint Size, duint* NumberOf
     return false;
 }
 
-bool MemIsValidReadPtr(duint Address)
+bool MemIsValidReadPtr(duint Address, bool cache)
 {
-    unsigned char a = 0;
-    return MemRead(Address, &a, sizeof(unsigned char));
+    if(cache)
+        return MemFindBaseAddr(Address, nullptr) != 0;
+    unsigned char ch;
+    return MemRead(Address, &ch, sizeof(ch));
+}
+
+bool MemIsValidReadPtrUnsafe(duint Address, bool cache)
+{
+    if(cache)
+        return MemFindBaseAddr(Address, nullptr) != 0;
+    unsigned char ch;
+    return MemReadUnsafe(Address, &ch, sizeof(ch));
 }
 
 bool MemIsCanonicalAddress(duint Address)
@@ -396,12 +469,7 @@ duint MemAllocRemote(duint Address, duint Size, DWORD Type, DWORD Protect)
 
 bool MemFreeRemote(duint Address)
 {
-    return VirtualFreeEx(fdProcessInfo->hProcess, (LPVOID)Address, 0, MEM_RELEASE) == TRUE;
-}
-
-duint MemGetPageAligned(duint Address)
-{
-    return PAGE_ALIGN(Address);
+    return !!VirtualFreeEx(fdProcessInfo->hProcess, (LPVOID)Address, 0, MEM_RELEASE);
 }
 
 bool MemGetPageInfo(duint Address, MEMPAGE* PageInfo, bool Refresh)
@@ -428,7 +496,7 @@ bool MemGetPageInfo(duint Address, MEMPAGE* PageInfo, bool Refresh)
 bool MemSetPageRights(duint Address, const char* Rights)
 {
     // Align address to page base
-    Address = MemGetPageAligned(Address);
+    Address = PAGE_ALIGN(Address);
 
     // String -> bit mask
     DWORD protect;
@@ -436,13 +504,13 @@ bool MemSetPageRights(duint Address, const char* Rights)
         return false;
 
     DWORD oldProtect;
-    return VirtualProtectEx(fdProcessInfo->hProcess, (void*)Address, PAGE_SIZE, protect, &oldProtect) == TRUE;
+    return !!VirtualProtectEx(fdProcessInfo->hProcess, (void*)Address, PAGE_SIZE, protect, &oldProtect);
 }
 
 bool MemGetPageRights(duint Address, char* Rights)
 {
     // Align address to page base
-    Address = MemGetPageAligned(Address);
+    Address = PAGE_ALIGN(Address);
 
     MEMORY_BASIC_INFORMATION mbi;
     memset(&mbi, 0, sizeof(MEMORY_BASIC_INFORMATION));
@@ -455,6 +523,11 @@ bool MemGetPageRights(duint Address, char* Rights)
 
 bool MemPageRightsToString(DWORD Protect, char* Rights)
 {
+    if(!Protect) //reserved pages don't have a protection (https://goo.gl/Izkk0c)
+    {
+        *Rights = '\0';
+        return true;
+    }
     switch(Protect & 0xFF)
     {
     case PAGE_NOACCESS:
@@ -480,6 +553,9 @@ bool MemPageRightsToString(DWORD Protect, char* Rights)
         break;
     case PAGE_EXECUTE_WRITECOPY:
         strcpy_s(Rights, RIGHTS_STRING_SIZE, "ERWC");
+        break;
+    default:
+        memset(Rights, 0, RIGHTS_STRING_SIZE);
         break;
     }
 
@@ -522,7 +598,7 @@ bool MemPageRightsFromString(DWORD* Protect, const char* Rights)
     return (*Protect != 0);
 }
 
-bool MemFindInPage(SimplePage page, duint startoffset, const std::vector<PatternByte> & pattern, std::vector<duint> & results, duint maxresults)
+bool MemFindInPage(const SimplePage & page, duint startoffset, const std::vector<PatternByte> & pattern, std::vector<duint> & results, duint maxresults)
 {
     if(startoffset >= page.size || results.size() >= maxresults)
         return false;
@@ -556,7 +632,7 @@ bool MemFindInMap(const std::vector<SimplePage> & pages, const std::vector<Patte
     for(const auto page : pages)
     {
         if(!MemFindInPage(page, 0, pattern, results, maxresults))
-            return false;
+            continue;
         if(progress)
             GuiReferenceSetProgress(int(floor((float(count) / float(total)) * 100.0f)));
         if(results.size() >= maxresults)
@@ -569,4 +645,142 @@ bool MemFindInMap(const std::vector<SimplePage> & pages, const std::vector<Patte
         GuiReferenceReloadData();
     }
     return true;
+}
+
+template<class T>
+static T ror(T x, unsigned int moves)
+{
+    return (x >> moves) | (x << (sizeof(T) * 8 - moves));
+}
+
+template<class T>
+static T rol(T x, unsigned int moves)
+{
+    return (x << moves) | (x >> (sizeof(T) * 8 - moves));
+}
+
+bool MemDecodePointer(duint* Pointer, bool vistaPlus)
+{
+    // Decode a pointer that has been encoded with a special "process cookie"
+    // http://doxygen.reactos.org/dd/dc6/lib_2rtl_2process_8c_ad52c0f8f48ce65475a02a5c334b3e959.html
+    typedef NTSTATUS(NTAPI * pfnNtQueryInformationProcess)(
+        IN  HANDLE ProcessHandle,
+        IN  LONG ProcessInformationClass,
+        OUT PVOID ProcessInformation,
+        IN  ULONG ProcessInformationLength,
+        OUT PULONG ReturnLength
+    );
+
+    static auto NtQIP = (pfnNtQueryInformationProcess)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationProcess");
+
+    // Verify
+    if(!NtQIP || !Pointer)
+        return false;
+
+    // Query the kernel for XOR key
+    ULONG cookie;
+
+    if(NtQIP(fdProcessInfo->hProcess, /* ProcessCookie */36, &cookie, sizeof(ULONG), nullptr) < 0)
+    {
+        if(!fallbackCookie)
+            return false;
+        cookie = fallbackCookie;
+    }
+
+    // Pointer adjustment (Windows Vista+)
+    if(vistaPlus)
+#ifdef _WIN64
+        *Pointer = ror(*Pointer, (0x40 - (cookie & 0x3F)) & 0xFF);
+#else
+        *Pointer = ror(*Pointer, (0x20 - (cookie & 0x1F)) & 0xFF);
+#endif //_WIN64
+
+    // XOR pointer with key
+    *Pointer ^= cookie;
+
+    return true;
+}
+
+void MemInitRemoteProcessCookie()
+{
+    // Clear previous session's cookie
+    fallbackCookie = 0;
+
+    // Windows XP/Vista/7 are unable to obtain remote process cookies using NtQueryInformationProcess
+    // Guess the cookie by brute-forcing all possible hashes and validate it using known encodings
+    duint RtlpUnhandledExceptionFilter = 0;
+    duint UnhandledExceptionFilter = 0;
+    duint SingleHandler = 0;
+    duint DefaultHandler = 0;
+
+#ifdef _WIN64
+    auto RtlpUnhandledExceptionFilterSymbol = "RtlpUnhandledExceptionFilter";
+    auto UnhandledExceptionFilterSymbol = "UnhandledExceptionFilter";
+    auto SingleHandlerSymbol = "SingleHandler";
+    auto DefaultHandlerSymbol = "DefaultHandler";
+#else
+    auto RtlpUnhandledExceptionFilterSymbol = "_RtlpUnhandledExceptionFilter";
+    auto UnhandledExceptionFilterSymbol = "_UnhandledExceptionFilter@4";
+    auto SingleHandlerSymbol = "_SingleHandler";
+    auto DefaultHandlerSymbol = "_DefaultHandler@4";
+#endif
+
+    if(!valfromstring(RtlpUnhandledExceptionFilterSymbol, &RtlpUnhandledExceptionFilter) ||
+            !valfromstring(UnhandledExceptionFilterSymbol, &UnhandledExceptionFilter) ||
+            !valfromstring(SingleHandlerSymbol, &SingleHandler) ||
+            !valfromstring(DefaultHandlerSymbol, &DefaultHandler))
+        return;
+
+    // Pointer encodings known at System Breakpoint. These may be invalid if attaching to a process.
+    // *ntdll.RtlpUnhandledExceptionFilter = EncodePointer(kernel32.UnhandledExceptionFilter)
+    duint encodedUnhandledExceptionFilter = 0;
+    if(!MemRead(RtlpUnhandledExceptionFilter, &encodedUnhandledExceptionFilter, sizeof(encodedUnhandledExceptionFilter)))
+        return;
+
+    // *kernel32.SingleHandler = EncodePointer(kernel32.DefaultHandler)
+    duint encodedDefaultHandler = 0;
+    if(!MemRead(SingleHandler, &encodedDefaultHandler, sizeof(encodedDefaultHandler)))
+        return;
+
+    auto isValidEncoding = [](ULONG CookieGuess, duint EncodedValue, duint DecodedValue)
+    {
+        return DecodedValue == (ror(EncodedValue, 0x40 - (CookieGuess & 0x3F)) ^ CookieGuess);
+    };
+
+    ULONG cookie = 0;
+    for(int i = 64; i > 0; i--)
+    {
+        const ULONG guess = ULONG(ror(encodedDefaultHandler, i) ^ DefaultHandler);
+        if(isValidEncoding(guess, encodedUnhandledExceptionFilter, UnhandledExceptionFilter) &&
+                isValidEncoding(guess, encodedDefaultHandler, DefaultHandler))
+        {
+            // cookie collision, we're unable to determine which cookie is correct
+            if(cookie && guess != cookie)
+                return;
+            cookie = guess;
+        }
+    }
+
+    fallbackCookie = cookie;
+}
+
+//Workaround for modules that have holes between sections, it keeps parts it couldn't read the same as the input
+void MemReadDumb(duint BaseAddress, void* Buffer, duint Size)
+{
+    if(!MemIsCanonicalAddress(BaseAddress) || !Buffer || !Size)
+        return;
+
+    duint offset = 0;
+    duint requestedSize = Size;
+    duint sizeLeftInFirstPage = PAGE_SIZE - (BaseAddress & (PAGE_SIZE - 1));
+    duint readSize = min(sizeLeftInFirstPage, requestedSize);
+
+    while(readSize)
+    {
+        SIZE_T bytesRead = 0;
+        MemoryReadSafe(fdProcessInfo->hProcess, (PVOID)(BaseAddress + offset), (PBYTE)Buffer + offset, readSize, &bytesRead);
+        offset += readSize;
+        requestedSize -= readSize;
+        readSize = min(PAGE_SIZE, requestedSize);
+    }
 }

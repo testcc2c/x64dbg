@@ -6,6 +6,7 @@
 
 #include "disasm_fast.h"
 #include "memory.h"
+#include "datainst_helper.h"
 
 static MEMORY_SIZE argsize2memsize(int argsize)
 {
@@ -23,12 +24,13 @@ static MEMORY_SIZE argsize2memsize(int argsize)
     return size_byte;
 }
 
-void fillbasicinfo(Capstone* cp, BASIC_INSTRUCTION_INFO* basicinfo)
+void fillbasicinfo(Capstone* cp, BASIC_INSTRUCTION_INFO* basicinfo, bool instrText)
 {
     //zero basicinfo
     memset(basicinfo, 0, sizeof(BASIC_INSTRUCTION_INFO));
     //copy instruction text
-    strcpy_s(basicinfo->instruction, cp->InstructionText().c_str());
+    if(instrText)
+        strcpy_s(basicinfo->instruction, cp->InstructionText().c_str());
     //instruction size
     basicinfo->size = cp->Size();
     //branch/call info
@@ -47,50 +49,57 @@ void fillbasicinfo(Capstone* cp, BASIC_INSTRUCTION_INFO* basicinfo)
         const cs_x86_op & op = cp->x86().operands[i];
         switch(op.type)
         {
-        case CS_OP_IMM:
+        case X86_OP_IMM:
         {
             if(basicinfo->branch)
             {
                 basicinfo->type |= TYPE_ADDR;
-                basicinfo->addr = (duint)op.imm;
-                basicinfo->value.value = (duint)op.imm + basicinfo->size;
+                basicinfo->addr = duint(op.imm);
+                basicinfo->value.value = duint(op.imm);
             }
             else
             {
                 basicinfo->type |= TYPE_VALUE;
-                basicinfo->value.size = (VALUE_SIZE)op.size;
-                basicinfo->value.value = (duint)op.imm;
+                basicinfo->value.size = VALUE_SIZE(op.size);
+                basicinfo->value.value = duint(op.imm);
             }
         }
         break;
 
-        case CS_OP_MEM:
+        case X86_OP_MEM:
         {
             const x86_op_mem & mem = op.mem;
-            strcpy_s(basicinfo->memory.mnemonic, cp->OperandText(i).c_str());
-            basicinfo->memory.size = (MEMORY_SIZE)op.size;
-            if(op.mem.base == X86_REG_RIP)  //rip-relative
+            if(instrText)
+                strcpy_s(basicinfo->memory.mnemonic, cp->OperandText(i).c_str());
+            basicinfo->memory.size = MEMORY_SIZE(op.size);
+            if(op.mem.base == X86_REG_RIP) //rip-relative
             {
-                basicinfo->memory.value = (ULONG_PTR)(cp->GetInstr()->address + op.mem.disp + basicinfo->size);
+                basicinfo->memory.value = ULONG_PTR(cp->Address() + op.mem.disp + basicinfo->size);
                 basicinfo->type |= TYPE_MEMORY;
             }
             else if(mem.disp)
             {
                 basicinfo->type |= TYPE_MEMORY;
-                basicinfo->memory.value = (ULONG_PTR)mem.disp;
+                basicinfo->memory.value = ULONG_PTR(mem.disp);
             }
         }
         break;
+
+        default:
+            break;
         }
     }
 }
 
-bool disasmfast(unsigned char* data, duint addr, BASIC_INSTRUCTION_INFO* basicinfo)
+bool disasmfast(const unsigned char* data, duint addr, BASIC_INSTRUCTION_INFO* basicinfo)
 {
     if(!data || !basicinfo)
         return false;
     Capstone cp;
-    if(!cp.Disassemble(addr, data, MAX_DISASM_BUFFER))
+    cp.Disassemble(addr, data, MAX_DISASM_BUFFER);
+    if(trydisasmfast(data, addr, basicinfo, cp.Success() ? cp.Size() : 1))
+        return true;
+    if(!cp.Success())
     {
         strcpy_s(basicinfo->instruction, "???");
         basicinfo->size = 1;
@@ -100,10 +109,10 @@ bool disasmfast(unsigned char* data, duint addr, BASIC_INSTRUCTION_INFO* basicin
     return true;
 }
 
-bool disasmfast(duint addr, BASIC_INSTRUCTION_INFO* basicinfo)
+bool disasmfast(duint addr, BASIC_INSTRUCTION_INFO* basicinfo, bool cache)
 {
     unsigned int data[16];
-    if(!MemRead(addr, data, sizeof(data)))
+    if(!MemRead(addr, data, sizeof(data), nullptr, cache))
         return false;
     return disasmfast((unsigned char*)data, addr, basicinfo);
 }

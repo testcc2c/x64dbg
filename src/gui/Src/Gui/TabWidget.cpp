@@ -1,6 +1,9 @@
 // Qt includes
 #include "tabbar.h"
 #include "tabwidget.h"
+#include <QMoveEvent>
+#include <QApplication>
+#include <QDesktopWidget>
 
 //////////////////////////////////////////////////////////////
 // Default Constructor
@@ -11,9 +14,11 @@ MHTabWidget::MHTabWidget(QWidget* parent, bool allowDetach, bool allowDelete) : 
     connect(m_tabBar, SIGNAL(OnDetachTab(int, QPoint &)), this, SLOT(DetachTab(int, QPoint &)));
     connect(m_tabBar, SIGNAL(OnMoveTab(int, int)), this, SLOT(MoveTab(int, int)));
     connect(m_tabBar, SIGNAL(OnDeleteTab(int)), this, SLOT(DeleteTab(int)));
+    connect(m_tabBar, SIGNAL(tabMoved(int, int)), this, SLOT(tabMoved(int, int)));
 
     setTabBar(m_tabBar);
     setMovable(true);
+    setStyleSheet("QTabWidget::pane { border: 0px; }");
 
     m_Windows.clear();
 }
@@ -46,6 +51,18 @@ int MHTabWidget::count() const
     return QTabWidget::count() + m_Windows.size();
 }
 
+QList<QWidget*> MHTabWidget::windows()
+{
+    return m_Windows;
+}
+
+// Add a tab
+int MHTabWidget::addTabEx(QWidget* widget, const QIcon & icon, const QString & label, const QString & nativeName)
+{
+    mNativeNames.append(nativeName);
+    return this->addTab(widget, icon, label);
+}
+
 // Convert an external window to a widget tab
 void MHTabWidget::AttachTab(QWidget* parent)
 {
@@ -54,18 +71,16 @@ void MHTabWidget::AttachTab(QWidget* parent)
     QWidget* tearOffWidget = detachedWidget->centralWidget();
 
     // Reattach the tab
-    int newIndex = addTab(tearOffWidget, detachedWidget->windowIcon(), detachedWidget->windowTitle());
+    addTabEx(tearOffWidget, detachedWidget->windowIcon(), detachedWidget->windowTitle(), detachedWidget->mNativeName);
 
     // Remove it from the windows list
     for(int i = 0; i < m_Windows.size(); i++)
     {
         if(m_Windows.at(i) == tearOffWidget)
+        {
             m_Windows.removeAt(i);
+        }
     }
-
-    // Make Active
-    if(newIndex != -1)
-        setCurrentIndex(newIndex);
 
     // Cleanup Window
     disconnect(detachedWidget, SIGNAL(OnClose(QWidget*)), this, SLOT(AttachTab(QWidget*)));
@@ -86,6 +101,7 @@ void MHTabWidget::DetachTab(int index, QPoint & dropPoint)
 
     detachedWidget->setWindowTitle(tabText(index));
     detachedWidget->setWindowIcon(tabIcon(index));
+    detachedWidget->mNativeName = mNativeNames[index];
 
     // Remove from tab bar
     QWidget* tearOffWidget = widget(index);
@@ -116,8 +132,12 @@ void MHTabWidget::DetachTab(int index, QPoint & dropPoint)
 // Swap two tab indices
 void MHTabWidget::MoveTab(int fromIndex, int toIndex)
 {
+    QString nativeName;
     removeTab(fromIndex);
+    nativeName = mNativeNames.at(fromIndex);
+    mNativeNames.removeAt(fromIndex);
     insertTab(toIndex, widget(fromIndex), tabIcon(fromIndex), tabText(fromIndex));
+    mNativeNames.insert(toIndex, nativeName);
     setCurrentIndex(toIndex);
 }
 
@@ -125,6 +145,16 @@ void MHTabWidget::MoveTab(int fromIndex, int toIndex)
 void MHTabWidget::DeleteTab(int index)
 {
     removeTab(index);
+    mNativeNames.removeAt(index);
+}
+
+void MHTabWidget::tabMoved(int from, int to)
+{
+    QString nativeName;
+    nativeName = mNativeNames.at(from);
+    mNativeNames.removeAt(from);
+    mNativeNames.insert(to, nativeName);
+    emit tabMovedTabWidget(from, to);
 }
 
 void MHTabWidget::setCurrentIndex(int index)
@@ -144,9 +174,71 @@ void MHTabWidget::setCurrentIndex(int index)
     }
 }
 
-QTabBar* MHTabWidget::tabBar() const
+MHTabBar* MHTabWidget::tabBar() const
 {
     return m_tabBar;
+}
+
+QString MHTabWidget::getNativeName(int index)
+{
+    if(index < count())
+    {
+        return mNativeNames.at(index);
+    }
+    else
+    {
+        MHDetachedWindow* window = dynamic_cast<MHDetachedWindow*>(widget(index)->parent());
+        if(window)
+            return window->mNativeName;
+        else
+            return QString();
+    }
+}
+
+void MHTabWidget::showPreviousTab()
+{
+    if(QTabWidget::count() <= 1)
+    {
+        return;
+    }
+
+    int previousTabIndex = QTabWidget::currentIndex();
+    if(previousTabIndex == 0)
+    {
+        previousTabIndex = QTabWidget::count() - 1;
+    }
+    else
+    {
+        previousTabIndex--;
+    }
+
+    QTabWidget::setCurrentIndex(previousTabIndex);
+}
+
+void MHTabWidget::showNextTab()
+{
+    if(QTabWidget::count() <= 1)
+    {
+        return;
+    }
+
+    QTabWidget::setCurrentIndex((QTabWidget::currentIndex() + 1) % QTabWidget::count());
+}
+
+void MHTabWidget::deleteCurrentTab()
+{
+    if(QTabWidget::count() == 0)
+    {
+        return;
+    }
+
+    int index = QTabWidget::currentIndex();
+    DeleteTab(index);
+    if(index < count())
+    {
+        // open the tab to the right of the deleted tab
+        setCurrentIndex(index);
+    }
 }
 
 //----------------------------------------------------------------------------

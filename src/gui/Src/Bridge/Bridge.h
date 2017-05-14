@@ -27,6 +27,7 @@ public:
 
     // Misc functions
     static void CopyToClipboard(const QString & text);
+    static void CopyToClipboard(const QString & text, const QString & htmlText);
 
     //result function
     void setResult(dsint result = 0);
@@ -40,13 +41,16 @@ public:
     void* winId;
     QWidget* scriptView;
     ReferenceManager* referenceManager;
+    QWidget* snowmanView;
+    bool mIsRunning = false;
 
 signals:
     void disassembleAt(dsint va, dsint eip);
     void repaintGui();
     void dbgStateChanged(DBGSTATE state);
-    void addMsgToLog(QString msg);
+    void addMsgToLog(QByteArray msg);
     void clearLog();
+    void close();
     void updateRegisters();
     void updateBreakpoints();
     void updateWindowTitle(QString filename);
@@ -70,6 +74,7 @@ signals:
     void referenceReloadData();
     void referenceSetSingleSelection(int index, bool scroll);
     void referenceSetProgress(int progress);
+    void referenceSetCurrentTaskProgress(int progress, QString taskTitle);
     void referenceSetSearchStartCol(int col);
     void referenceInitialize(QString name);
     void stackDumpAt(duint va, duint csp);
@@ -90,6 +95,9 @@ signals:
     void selectionDumpSet(const SELECTIONDATA* selection);
     void selectionStackGet(SELECTIONDATA* selection);
     void selectionStackSet(const SELECTIONDATA* selection);
+    void selectionGraphGet(SELECTIONDATA* selection);
+    void selectionMemmapGet(SELECTIONDATA* selection);
+    void selectionSymmodGet(SELECTIONDATA* selection);
     void getStrWindow(const QString title, QString* text);
     void autoCompleteAddCmd(const QString cmd);
     void autoCompleteDelCmd(const QString cmd);
@@ -99,10 +107,18 @@ signals:
     void repaintTableView();
     void updatePatches();
     void updateCallStack();
+    void updateSEHChain();
+    void updateArgumentView();
     void symbolRefreshCurrent();
     void loadSourceFile(const QString path, int line, int selection);
     void setIconMenuEntry(int hEntry, QIcon icon);
     void setIconMenu(int hMenu, QIcon icon);
+    void setCheckedMenuEntry(int hEntry, bool checked);
+    void setVisibleMenuEntry(int hEntry, bool visible);
+    void setVisibleMenu(int hMenu, bool visible);
+    void setNameMenuEntry(int hEntry, QString name);
+    void setNameMenu(int hMenu, QString name);
+    void setHotkeyMenuEntry(int hEntry, QString hotkey, QString id);
     void showCpu();
     void addQWidgetTab(QWidget* qWidget);
     void showQWidgetTab(QWidget* qWidget);
@@ -113,12 +129,41 @@ signals:
     void getGlobalNotes(void* text);
     void setDebuggeeNotes(const QString text);
     void getDebuggeeNotes(void* text);
+    void dumpAtN(duint va, int index);
+    void displayWarning(QString title, QString text);
+    void registerScriptLang(SCRIPTTYPEINFO* info);
+    void unregisterScriptLang(int id);
+    void focusDisasm();
+    void focusDump();
+    void focusStack();
+    void focusGraph();
+    void focusMemmap();
+    void updateWatch();
+    void loadGraph(BridgeCFGraphList* graph, duint addr);
+    void graphAt(duint addr);
+    void updateGraph();
+    void setLogEnabled(bool enabled);
+    void addFavouriteItem(int type, const QString & name, const QString & description);
+    void setFavouriteItemShortcut(int type, const QString & name, const QString & shortcut);
+    void foldDisassembly(duint startAddr, duint length);
+    void selectInMemoryMap(duint addr);
+    void getActiveView(ACTIVEVIEW* activeView);
+    void addInfoLine(const QString & text);
+    void typeAddNode(void* parent, const TYPEDESCRIPTOR* type);
+    void typeClear();
+    void typeUpdateWidget();
+    void closeApplication();
+    void flushLog();
+    void getDumpAttention();
 
 private:
     QMutex* mBridgeMutex;
     dsint bridgeResult;
-    volatile bool hasBridgeResult;
+    HANDLE hResultEvent;
     volatile bool dbgStopped;
 };
+
+void DbgCmdExec(const QString & cmd);
+bool DbgCmdExecDirect(const QString & cmd);
 
 #endif // BRIDGE_H

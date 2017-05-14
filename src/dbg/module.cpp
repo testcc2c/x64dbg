@@ -1,12 +1,14 @@
 #include "module.h"
-#include "debugger.h"
+#include "TitanEngine/TitanEngine.h"
 #include "threading.h"
 #include "symbolinfo.h"
 #include "murmurhash.h"
 #include "memory.h"
 #include "label.h"
+#include <algorithm>
 
 std::map<Range, MODINFO, RangeCompare> modinfo;
+std::unordered_map<duint, std::string> hashNameMap;
 
 void GetModuleInfo(MODINFO & Info, ULONG_PTR FileMapVA)
 {
@@ -45,6 +47,9 @@ void GetModuleInfo(MODINFO & Info, ULONG_PTR FileMapVA)
         // Add entry to the vector
         Info.sections.push_back(curSection);
     }
+
+    // Clear imports by default
+    Info.imports.clear();
 }
 
 bool ModLoad(duint Base, duint Size, const char* FullPath)
@@ -55,6 +60,7 @@ bool ModLoad(duint Base, duint Size, const char* FullPath)
 
     // Copy the module path in the struct
     MODINFO info;
+    memset(&info, 0, sizeof(info));
     strcpy_s(info.path, FullPath);
 
     // Break the module path into a directory and file name
@@ -97,23 +103,43 @@ bool ModLoad(duint Base, duint Size, const char* FullPath)
     strcpy_s(info.name, file);
     info.base = Base;
     info.size = Size;
+    info.fileHandle = nullptr;
+    info.loadedSize = 0;
+    info.fileMap = nullptr;
+    info.fileMapVA = 0;
+
+    // Determine whether the module is located in system
+    wchar_t sysdir[MAX_PATH];
+    GetEnvironmentVariableW(L"windir", sysdir, _countof(sysdir));
+    String Utf8Sysdir = StringUtils::Utf16ToUtf8(sysdir);
+    Utf8Sysdir.append("\\");
+    if(_memicmp(Utf8Sysdir.c_str(), FullPath, Utf8Sysdir.size()) == 0)
+    {
+        info.party = 1;
+    }
+    else
+    {
+        info.party = 0;
+    }
 
     // Load module data
     bool virtualModule = strstr(FullPath, "virtual:\\") == FullPath;
 
     if(!virtualModule)
     {
-        HANDLE fileHandle;
-        DWORD loadedSize;
-        HANDLE fileMap;
-        ULONG_PTR fileMapVA;
-        WString wszFullPath = StringUtils::Utf8ToUtf16(FullPath);
+        auto wszFullPath = StringUtils::Utf8ToUtf16(FullPath);
 
         // Load the physical module from disk
-        if(StaticFileLoadW(wszFullPath.c_str(), UE_ACCESS_READ, false, &fileHandle, &loadedSize, &fileMap, &fileMapVA))
+        if(StaticFileLoadW(wszFullPath.c_str(), UE_ACCESS_READ, false, &info.fileHandle, &info.loadedSize, &info.fileMap, &info.fileMapVA))
         {
-            GetModuleInfo(info, fileMapVA);
-            StaticFileUnloadW(wszFullPath.c_str(), false, fileHandle, loadedSize, fileMap, fileMapVA);
+            GetModuleInfo(info, info.fileMapVA);
+        }
+        else
+        {
+            info.fileHandle = nullptr;
+            info.loadedSize = 0;
+            info.fileMap = nullptr;
+            info.fileMapVA = 0;
         }
     }
     else
@@ -157,6 +183,11 @@ bool ModUnload(duint Base)
     if(found == modinfo.end())
         return false;
 
+    // Unload the mapped file from memory
+    const auto & info = found->second;
+    if(info.fileMapVA)
+        StaticFileUnloadW(StringUtils::Utf8ToUtf16(info.path).c_str(), false, info.fileHandle, info.loadedSize, info.fileMap, info.fileMapVA);
+
     // Remove it from the list
     modinfo.erase(found);
     EXCLUSIVE_RELEASE();
@@ -168,10 +199,26 @@ bool ModUnload(duint Base)
 
 void ModClear()
 {
-    // Clean up all the modules
-    EXCLUSIVE_ACQUIRE(LockModules);
-    modinfo.clear();
-    EXCLUSIVE_RELEASE();
+    {
+        // Clean up all the modules
+        EXCLUSIVE_ACQUIRE(LockModules);
+
+        for(const auto & mod : modinfo)
+        {
+            // Unload the mapped file from memory
+            const auto & info = mod.second;
+            if(info.fileMapVA)
+                StaticFileUnloadW(StringUtils::Utf8ToUtf16(info.path).c_str(), false, info.fileHandle, info.loadedSize, info.fileMap, info.fileMapVA);
+        }
+
+        modinfo.clear();
+    }
+
+    {
+        // Clean up the reverse hash map
+        EXCLUSIVE_ACQUIRE(LockModuleHashes);
+        hashNameMap.clear();
+    }
 
     // Tell the symbol updater
     GuiSymbolUpdateModuleList(0, nullptr);
@@ -200,7 +247,10 @@ bool ModNameFromAddr(duint Address, char* Name, bool Extension)
     auto module = ModInfoFromAddr(Address);
 
     if(!module)
+    {
+        Name[0] = '\0';
         return false;
+    }
 
     // Copy initial module name
     strcpy_s(Name, MAX_MODULE_SIZE, module->name);
@@ -236,19 +286,50 @@ duint ModHashFromAddr(duint Address)
     return module->hash + (Address - module->base);
 }
 
+duint ModContentHashFromAddr(duint Address)
+{
+    SHARED_ACQUIRE(LockModules);
+
+    auto module = ModInfoFromAddr(Address);
+
+    if(!module)
+        return 0;
+
+    if(module->fileMapVA != 0 && module->loadedSize > 0)
+        return murmurhash((void*)module->fileMapVA, module->loadedSize);
+    else
+        return 0;
+}
+
 duint ModHashFromName(const char* Module)
 {
     // return MODINFO.hash (based on the name)
     ASSERT_NONNULL(Module);
-    ASSERT_FALSE(Module[0] == '\0');
+    auto len = int(strlen(Module));
+    if(!len)
+        return 0;
+    auto hash = murmurhash(Module, len);
 
-    return murmurhash(Module, (int)strlen(Module));
+    //update the hash cache
+    SHARED_ACQUIRE(LockModuleHashes);
+    auto hashInCache = hashNameMap.find(hash) != hashNameMap.end();
+    SHARED_RELEASE();
+    if(!hashInCache)
+    {
+        EXCLUSIVE_ACQUIRE(LockModuleHashes);
+        hashNameMap[hash] = Module;
+    }
+
+    return hash;
 }
 
 duint ModBaseFromName(const char* Module)
 {
     ASSERT_NONNULL(Module);
-    ASSERT_TRUE(strlen(Module) < MAX_MODULE_SIZE);
+    auto len = int(strlen(Module));
+    if(!len)
+        return 0;
+    ASSERT_TRUE(len < MAX_MODULE_SIZE);
     SHARED_ACQUIRE(LockModules);
 
     for(const auto & i : modinfo)
@@ -278,6 +359,15 @@ duint ModSizeFromAddr(duint Address)
     return module->size;
 }
 
+std::string ModNameFromHash(duint Hash)
+{
+    SHARED_ACQUIRE(LockModuleHashes);
+    auto found = hashNameMap.find(Hash);
+    if(found == hashNameMap.end())
+        return std::string();
+    return found->second;
+}
+
 bool ModSectionsFromAddr(duint Address, std::vector<MODSECTIONINFO>* Sections)
 {
     SHARED_ACQUIRE(LockModules);
@@ -289,6 +379,20 @@ bool ModSectionsFromAddr(duint Address, std::vector<MODSECTIONINFO>* Sections)
 
     // Copy vector <-> vector
     *Sections = module->sections;
+    return true;
+}
+
+bool ModImportsFromAddr(duint Address, std::vector<MODIMPORTINFO>* Imports)
+{
+    SHARED_ACQUIRE(LockModules);
+
+    auto module = ModInfoFromAddr(Address);
+
+    if(!module)
+        return false;
+
+    // Copy vector <-> vector
+    *Imports = module->imports;
     return true;
 }
 
@@ -328,4 +432,59 @@ void ModGetList(std::vector<MODINFO> & list)
     list.clear();
     for(const auto & mod : modinfo)
         list.push_back(mod.second);
+}
+
+bool ModAddImportToModule(duint Base, const MODIMPORTINFO & importInfo)
+{
+    SHARED_ACQUIRE(LockModules);
+
+    if(!Base || !importInfo.addr)
+        return false;
+
+    auto module = ModInfoFromAddr(Base);
+
+    if(!module)
+        return false;
+
+    // Search in Import Vector
+    auto pImports = &(module->imports);
+    auto it = std::find_if(pImports->begin(), pImports->end(), [&importInfo](const MODIMPORTINFO & currentImportInfo)->bool
+    {
+        return (importInfo.addr == currentImportInfo.addr);
+    });
+
+    // Import in the list already
+    if(it != pImports->end())
+        return false;
+
+    // Add import to imports vector
+    pImports->push_back(importInfo);
+
+    return true;
+}
+
+int ModGetParty(duint Address)
+{
+    SHARED_ACQUIRE(LockModules);
+
+    auto module = ModInfoFromAddr(Address);
+
+    // If the module is not found, it is an user module
+    if(!module)
+        return 0;
+
+    return module->party;
+}
+
+void ModSetParty(duint Address, int Party)
+{
+    EXCLUSIVE_ACQUIRE(LockModules);
+
+    auto module = ModInfoFromAddr(Address);
+
+    // If the module is not found, it is an user module
+    if(!module)
+        return;
+
+    module->party = Party;
 }

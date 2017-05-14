@@ -4,16 +4,14 @@
 #include <QIcon>
 #include <QFileDialog>
 #include <QTextStream>
+#include "MiscUtil.h"
 
 PatchDialog::PatchDialog(QWidget* parent) :
     QDialog(parent),
     ui(new Ui::PatchDialog)
 {
     ui->setupUi(this);
-#if QT_VERSION < QT_VERSION_CHECK(5,0,0)
-    setWindowFlags(Qt::Dialog | Qt::WindowSystemMenuHint | Qt::WindowMinimizeButtonHint | Qt::WindowTitleHint | Qt::MSWindowsFixedSizeDialogHint);
-#endif
-    setFixedSize(this->size()); //fixed size
+    setWindowFlags(windowFlags() & ~Qt::WindowContextHelpButtonHint | Qt::MSWindowsFixedSizeDialogHint);
     setModal(false); //non-modal window
 
     connect(Bridge::getBridge(), SIGNAL(updatePatches()), this, SLOT(updatePatches()));
@@ -27,7 +25,6 @@ PatchDialog::PatchDialog(QWidget* parent) :
     connect(mGroupSelector, SIGNAL(groupPrevious()), this, SLOT(groupPrevious()));
     connect(mGroupSelector, SIGNAL(groupNext()), this, SLOT(groupNext()));
 
-    mPatches = new PatchMap();
     mIsWorking = false;
 }
 
@@ -40,8 +37,8 @@ bool PatchDialog::isPartOfPreviousGroup(const PatchInfoList & patchList, int ind
 {
     if(!index)
         return true;
-    uint addr = patchList.at(index).first.addr;
-    uint prevAddr = patchList.at(index - 1).first.addr;
+    uint addr = patchList.at(index).patch.addr;
+    uint prevAddr = patchList.at(index - 1).patch.addr;
     for(int i = 1; i < 10; i++) //10 bytes in between groups
         if(addr - i == prevAddr)
             return true;
@@ -51,7 +48,7 @@ bool PatchDialog::isPartOfPreviousGroup(const PatchInfoList & patchList, int ind
 bool PatchDialog::isGroupEnabled(const PatchInfoList & patchList, int group)
 {
     for(int i = 0; i < patchList.size(); i++)
-        if(patchList.at(i).second.group == group && !patchList.at(i).second.checked)
+        if(patchList.at(i).status.group == group && !patchList.at(i).status.checked)
             return false;
     return true;
 }
@@ -59,7 +56,7 @@ bool PatchDialog::isGroupEnabled(const PatchInfoList & patchList, int group)
 bool PatchDialog::hasPreviousGroup(const PatchInfoList & patchList, int group)
 {
     for(int i = 0; i < patchList.size(); i++)
-        if(patchList.at(i).second.group < group)
+        if(patchList.at(i).status.group < group)
             return true;
     return false;
 }
@@ -67,7 +64,7 @@ bool PatchDialog::hasPreviousGroup(const PatchInfoList & patchList, int group)
 bool PatchDialog::hasNextGroup(const PatchInfoList & patchList, int group)
 {
     for(int i = 0; i < patchList.size(); i++)
-        if(patchList.at(i).second.group > group)
+        if(patchList.at(i).status.group > group)
             return true;
     return false;
 }
@@ -75,8 +72,8 @@ bool PatchDialog::hasNextGroup(const PatchInfoList & patchList, int group)
 dsint PatchDialog::getGroupAddress(const PatchInfoList & patchList, int group)
 {
     for(int i = 0; i < patchList.size(); i++)
-        if(patchList.at(i).second.group == group)
-            return patchList.at(i).first.addr;
+        if(patchList.at(i).status.group == group)
+            return patchList.at(i).patch.addr;
     return -1;
 }
 
@@ -97,12 +94,11 @@ void PatchDialog::updatePatches()
     //clear GUI
     ui->listModules->clear();
     ui->listPatches->clear();
-    delete mPatches;
-    mPatches = new PatchMap();
+    mPatches.clear();
 
     //get patches from DBG
     size_t cbsize;
-    if(!DbgFunctions()->PatchEnum(0, &cbsize))
+    if(!DbgFunctions()->PatchEnum || !DbgFunctions()->PatchEnum(0, &cbsize))
         return;
     int numPatches = (int)cbsize / sizeof(DBGPATCHINFO);
     if(!numPatches)
@@ -127,20 +123,20 @@ void PatchDialog::updatePatches()
         if(!*patches[i].mod)
             continue;
         QString mod = patches[i].mod;
-        PatchMap::iterator found = mPatches->find(mod);
-        if(found != mPatches->end()) //found
-            (*mPatches)[mod].append(PatchPair(patches[i], defaultStatus));
+        PatchMap::iterator found = mPatches.find(mod);
+        if(found != mPatches.end()) //found
+            mPatches[mod].append(PatchPair(patches[i], defaultStatus));
         else //not found
         {
             PatchInfoList patchList;
             patchList.append(PatchPair(patches[i], defaultStatus));
-            mPatches->insert(mod, patchList);
+            mPatches.insert(mod, patchList);
         }
     }
     delete [] patches;
 
     //sort the patches by address
-    for(PatchMap::iterator i = mPatches->begin(); i != mPatches->end(); ++i)
+    for(PatchMap::iterator i = mPatches.begin(); i != mPatches.end(); ++i)
     {
         qSort(i.value().begin(), i.value().end(), PatchInfoLess);
         PatchInfoList & curPatchList = i.value();
@@ -149,12 +145,15 @@ void PatchDialog::updatePatches()
         {
             if(!isPartOfPreviousGroup(curPatchList, j))
                 group++;
-            curPatchList[j].second.group = group;
+            curPatchList[j].status.group = group;
+            unsigned char byte;
+            if(DbgMemRead(curPatchList[j].patch.addr, &byte, sizeof(byte)))
+                curPatchList[j].status.checked = byte == curPatchList[j].patch.newbyte;
         }
         ui->listModules->addItem(i.key());
     }
 
-    if(mPatches->size())
+    if(mPatches.size())
         ui->listModules->item(0)->setSelected(true); //select first module
 
     mIsWorking = false;
@@ -166,8 +165,8 @@ void PatchDialog::groupToggle()
     if(mIsWorking || !ui->listModules->selectedItems().size())
         return;
     QString mod = ui->listModules->selectedItems().at(0)->text();
-    PatchMap::iterator found = mPatches->find(mod);
-    if(found == mPatches->end()) //not found
+    PatchMap::iterator found = mPatches.find(mod);
+    if(found == mPatches.end()) //not found
         return;
     PatchInfoList & curPatchList = found.value();
     bool enabled = !isGroupEnabled(curPatchList, group);
@@ -175,21 +174,21 @@ void PatchDialog::groupToggle()
     mIsWorking = true;
     for(int i = 0; i < curPatchList.size(); i++)
     {
-        if(curPatchList.at(i).second.group != group)
+        if(curPatchList.at(i).status.group != group)
             continue;
         ui->listPatches->item(i)->setCheckState(checkState);
-        curPatchList[i].second.checked = enabled;
+        curPatchList[i].status.checked = enabled;
         //change the byte to reflect the change for the user (cypherpunk reported this)
-        unsigned char writebyte = curPatchList[i].second.checked ? curPatchList[i].first.newbyte : curPatchList[i].first.oldbyte;
-        DbgMemWrite(curPatchList[i].first.addr, &writebyte, sizeof(writebyte));
+        unsigned char writebyte = curPatchList[i].status.checked ? curPatchList[i].patch.newbyte : curPatchList[i].patch.oldbyte;
+        DbgMemWrite(curPatchList[i].patch.addr, &writebyte, sizeof(writebyte));
     }
-    GuiUpdateAllViews();
     mIsWorking = false;
     dsint groupStart = getGroupAddress(curPatchList, group);
+    GuiUpdateAllViews();
     if(!groupStart)
         return;
     QString color = enabled ? "#00DD00" : "red";
-    QString addrText = QString("%1").arg(groupStart, sizeof(dsint) * 2, 16, QChar('0')).toUpper();
+    QString addrText = ToPtrString(groupStart);
     QString title = "<font color='" + color + "'><b>" + QString().sprintf("%d:", group) + addrText + "</b></font>";
     mGroupSelector->setGroupTitle(title);
     DbgCmdExecDirect(QString("disasm " + addrText).toUtf8().constData());
@@ -202,15 +201,15 @@ void PatchDialog::groupPrevious()
     if(!ui->listModules->selectedItems().size())
         return;
     QString mod = ui->listModules->selectedItems().at(0)->text();
-    PatchMap::iterator found = mPatches->find(mod);
-    if(found == mPatches->end()) //not found
+    PatchMap::iterator found = mPatches.find(mod);
+    if(found == mPatches.end()) //not found
         return;
     PatchInfoList & curPatchList = found.value();
     if(!hasPreviousGroup(curPatchList, group))
         return;
     group--;
     QString color = isGroupEnabled(curPatchList, group) ? "#00DD00" : "red";
-    QString addrText = QString("%1").arg(getGroupAddress(curPatchList, group), sizeof(dsint) * 2, 16, QChar('0')).toUpper();
+    QString addrText = ToPtrString(getGroupAddress(curPatchList, group));
     QString title = "<font color='" + color + "'><b>" + QString().sprintf("%d:", group) + addrText + "</b></font>";
     mGroupSelector->setGroupTitle(title);
     mGroupSelector->setGroup(group);
@@ -227,15 +226,15 @@ void PatchDialog::groupNext()
     if(!ui->listModules->selectedItems().size())
         return;
     QString mod = ui->listModules->selectedItems().at(0)->text();
-    PatchMap::iterator found = mPatches->find(mod);
-    if(found == mPatches->end()) //not found
+    PatchMap::iterator found = mPatches.find(mod);
+    if(found == mPatches.end()) //not found
         return;
     PatchInfoList & curPatchList = found.value();
     if(!hasNextGroup(curPatchList, group))
         return;
     group++;
     QString color = isGroupEnabled(curPatchList, group) ? "#00DD00" : "red";
-    QString addrText = QString("%1").arg(getGroupAddress(curPatchList, group), sizeof(dsint) * 2, 16, QChar('0')).toUpper();
+    QString addrText = ToPtrString(getGroupAddress(curPatchList, group));
     QString title = "<font color='" + color + "'><b>" + QString().sprintf("%d:", group) + addrText + "</b></font>";
     mGroupSelector->setGroupTitle(title);
     mGroupSelector->setGroup(group);
@@ -251,19 +250,19 @@ void PatchDialog::on_listModules_itemSelectionChanged()
     if(!ui->listModules->selectedItems().size())
         return;
     QString mod(ui->listModules->selectedItems().at(0)->text());
-    PatchMap::iterator found = mPatches->find(mod);
-    if(found == mPatches->end()) //not found
+    PatchMap::iterator found = mPatches.find(mod);
+    if(found == mPatches.end()) //not found
         return;
     mIsWorking = true;
     PatchInfoList & patchList = found.value();
     ui->listPatches->clear();
     for(int i = 0; i < patchList.size(); i++)
     {
-        const DBGPATCHINFO curPatch = patchList.at(i).first;
-        QString addrText = QString("%1").arg(curPatch.addr, sizeof(dsint) * 2, 16, QChar('0')).toUpper();
-        QListWidgetItem* item = new QListWidgetItem(QString().sprintf("%d", patchList.at(i).second.group).rightJustified(4, ' ', true) + "|" + addrText + QString().sprintf(":%.2X->%.2X", curPatch.oldbyte, curPatch.newbyte), ui->listPatches);
+        const DBGPATCHINFO curPatch = patchList.at(i).patch;
+        QString addrText = ToPtrString(curPatch.addr);
+        QListWidgetItem* item = new QListWidgetItem(QString().sprintf("%d", patchList.at(i).status.group).rightJustified(4, ' ', true) + "|" + addrText + QString().sprintf(":%.2X->%.2X", curPatch.oldbyte, curPatch.newbyte), ui->listPatches);
         item->setFlags(item->flags() | Qt::ItemIsUserCheckable);
-        Qt::CheckState state = patchList.at(i).second.checked ? Qt::Checked : Qt::Unchecked;
+        Qt::CheckState state = patchList.at(i).status.checked ? Qt::Checked : Qt::Unchecked;
         item->setCheckState(state);
     }
     mIsWorking = false;
@@ -274,43 +273,43 @@ void PatchDialog::on_listPatches_itemChanged(QListWidgetItem* item) //checkbox c
     if(mIsWorking || !ui->listModules->selectedItems().size())
         return;
     QString mod = ui->listModules->selectedItems().at(0)->text();
-    PatchMap::iterator found = mPatches->find(mod);
-    if(found == mPatches->end()) //not found
+    PatchMap::iterator found = mPatches.find(mod);
+    if(found == mPatches.end()) //not found
         return;
     bool checked = item->checkState() == Qt::Checked;
     PatchInfoList & curPatchList = found.value();
     PatchPair & patch = curPatchList[ui->listPatches->row(item)];
-    if(patch.second.checked == checked) //check state did not change
+    if(patch.status.checked == checked) //check state did not change
         return;
-    patch.second.checked = checked;
+    patch.status.checked = checked;
     //change the byte to reflect the change for the user (cypherpunk reported this)
-    unsigned char writebyte = patch.second.checked ? patch.first.newbyte : patch.first.oldbyte;
-    DbgMemWrite(patch.first.addr, &writebyte, sizeof(writebyte));
+    unsigned char writebyte = patch.status.checked ? patch.patch.newbyte : patch.patch.oldbyte;
+    DbgMemWrite(patch.patch.addr, &writebyte, sizeof(writebyte));
     //check state changed
     if((QApplication::keyboardModifiers() & Qt::ControlModifier) != Qt::ControlModifier)
     {
         mIsWorking = true;
         //check/uncheck the complete group
         for(int i = 0; i < curPatchList.size(); i++)
-            if(curPatchList.at(i).second.group == patch.second.group)
+            if(curPatchList.at(i).status.group == patch.status.group)
             {
                 //change the patch state
-                curPatchList[i].second.checked = checked;
+                curPatchList[i].status.checked = checked;
                 ui->listPatches->item(i)->setCheckState(item->checkState());
                 //change the byte to reflect the change for the user (cypherpunk reported this)
-                unsigned char writebyte = curPatchList[i].second.checked ? curPatchList[i].first.newbyte : curPatchList[i].first.oldbyte;
-                DbgMemWrite(curPatchList[i].first.addr, &writebyte, sizeof(writebyte));
+                unsigned char writebyte = curPatchList[i].status.checked ? curPatchList[i].patch.newbyte : curPatchList[i].patch.oldbyte;
+                DbgMemWrite(curPatchList[i].patch.addr, &writebyte, sizeof(writebyte));
             }
         mIsWorking = false;
     }
-    GuiUpdateAllViews();
     int group = mGroupSelector->group();
     QString color = isGroupEnabled(curPatchList, group) ? "#00DD00" : "red";
-    QString addrText = QString("%1").arg(getGroupAddress(curPatchList, group), sizeof(dsint) * 2, 16, QChar('0')).toUpper();
+    QString addrText = ToPtrString(getGroupAddress(curPatchList, group));
     QString title = "<font color='" + color + "'><b>" + QString().sprintf("%d:", group) + addrText + "</b></font>";
     mGroupSelector->setGroupTitle(title);
     mGroupSelector->setPreviousEnabled(hasPreviousGroup(curPatchList, group));
     mGroupSelector->setNextEnabled(hasNextGroup(curPatchList, group));
+    GuiUpdateAllViews();
 }
 
 void PatchDialog::on_btnSelectAll_clicked()
@@ -318,17 +317,17 @@ void PatchDialog::on_btnSelectAll_clicked()
     if(!ui->listModules->selectedItems().size())
         return;
     QString mod = ui->listModules->selectedItems().at(0)->text();
-    PatchMap::iterator found = mPatches->find(mod);
-    if(found == mPatches->end()) //not found
+    PatchMap::iterator found = mPatches.find(mod);
+    if(found == mPatches.end()) //not found
         return;
     mIsWorking = true;
     PatchInfoList & curPatchList = found.value();
     for(int i = 0; i < curPatchList.size(); i++)
     {
         ui->listPatches->item(i)->setCheckState(Qt::Checked);
-        curPatchList[i].second.checked = true;
+        curPatchList[i].status.checked = true;
         //change the byte to reflect the change for the user (cypherpunk reported this)
-        DbgMemWrite(curPatchList[i].first.addr, &curPatchList[i].first.newbyte, sizeof(unsigned char));
+        DbgMemWrite(curPatchList[i].patch.addr, &curPatchList[i].patch.newbyte, sizeof(unsigned char));
     }
     GuiUpdateAllViews();
     mIsWorking = false;
@@ -339,17 +338,17 @@ void PatchDialog::on_btnDeselectAll_clicked()
     if(!ui->listModules->selectedItems().size())
         return;
     QString mod = ui->listModules->selectedItems().at(0)->text();
-    PatchMap::iterator found = mPatches->find(mod);
-    if(found == mPatches->end()) //not found
+    PatchMap::iterator found = mPatches.find(mod);
+    if(found == mPatches.end()) //not found
         return;
     mIsWorking = true;
     PatchInfoList & curPatchList = found.value();
     for(int i = 0; i < curPatchList.size(); i++)
     {
         ui->listPatches->item(i)->setCheckState(Qt::Unchecked);
-        curPatchList[i].second.checked = false;
+        curPatchList[i].status.checked = false;
         //change the byte to reflect the change for the user (cypherpunk reported this)
-        DbgMemWrite(curPatchList[i].first.addr, &curPatchList[i].first.oldbyte, sizeof(unsigned char));
+        DbgMemWrite(curPatchList[i].patch.addr, &curPatchList[i].patch.oldbyte, sizeof(unsigned char));
     }
     GuiUpdateAllViews();
     mIsWorking = false;
@@ -361,8 +360,8 @@ void PatchDialog::on_btnRestoreSelected_clicked()
         return;
     int selModIdx = ui->listModules->row(ui->listModules->selectedItems().at(0));
     QString mod = ui->listModules->selectedItems().at(0)->text();
-    PatchMap::iterator found = mPatches->find(mod);
-    if(found == mPatches->end()) //not found
+    PatchMap::iterator found = mPatches.find(mod);
+    if(found == mPatches.end()) //not found
         return;
     mIsWorking = true;
     PatchInfoList & curPatchList = found.value();
@@ -370,9 +369,9 @@ void PatchDialog::on_btnRestoreSelected_clicked()
     int total = curPatchList.size();
     for(int i = 0; i < total; i++)
     {
-        if(curPatchList.at(i).second.checked)
+        if(curPatchList.at(i).status.checked)
         {
-            DbgFunctions()->PatchRestore(curPatchList.at(i).first.addr);
+            DbgFunctions()->PatchRestore(curPatchList.at(i).patch.addr);
             removed++;
         }
     }
@@ -388,15 +387,15 @@ void PatchDialog::on_listPatches_itemSelectionChanged()
     if(!ui->listModules->selectedItems().size() || !ui->listPatches->selectedItems().size())
         return;
     QString mod = ui->listModules->selectedItems().at(0)->text();
-    PatchMap::iterator found = mPatches->find(mod);
-    if(found == mPatches->end()) //not found
+    PatchMap::iterator found = mPatches.find(mod);
+    if(found == mPatches.end()) //not found
         return;
     PatchInfoList & curPatchList = found.value();
     PatchPair & patch = curPatchList[ui->listPatches->row(ui->listPatches->selectedItems().at(0))]; //selected item
-    dsint groupStart = getGroupAddress(curPatchList, patch.second.group);
+    dsint groupStart = getGroupAddress(curPatchList, patch.status.group);
     if(!groupStart)
         return;
-    QString addrText = QString("%1").arg(groupStart, sizeof(dsint) * 2, 16, QChar('0')).toUpper();
+    QString addrText = ToPtrString(groupStart);
     DbgCmdExecDirect(QString("disasm " + addrText).toUtf8().constData());
     DbgCmdExecDirect(QString("dump " + addrText).toUtf8().constData());
 }
@@ -406,8 +405,8 @@ void PatchDialog::on_btnPickGroups_clicked()
     if(!ui->listModules->selectedItems().size())
         return;
     QString mod = ui->listModules->selectedItems().at(0)->text();
-    PatchMap::iterator found = mPatches->find(mod);
-    if(found == mPatches->end()) //not found
+    PatchMap::iterator found = mPatches.find(mod);
+    if(found == mPatches.end()) //not found
         return;
     PatchInfoList & curPatchList = found.value();
     if(!curPatchList.size())
@@ -416,7 +415,7 @@ void PatchDialog::on_btnPickGroups_clicked()
 
     int group = mGroupSelector->group();
     QString color = isGroupEnabled(curPatchList, group) ? "#00DD00" : "red";
-    QString addrText = QString("%1").arg(getGroupAddress(curPatchList, group), sizeof(dsint) * 2, 16, QChar('0')).toUpper();
+    QString addrText = ToPtrString(getGroupAddress(curPatchList, group));
     QString title = "<font color='" + color + "'><b>" + QString().sprintf("%d:", group) + addrText + "</b></font>";
     mGroupSelector->setGroupTitle(title);
     mGroupSelector->setPreviousEnabled(hasPreviousGroup(curPatchList, group));
@@ -432,20 +431,20 @@ void PatchDialog::on_btnPatchFile_clicked()
     if(!ui->listModules->selectedItems().size())
         return;
     QString mod = ui->listModules->selectedItems().at(0)->text();
-    PatchMap::iterator found = mPatches->find(mod);
-    if(found == mPatches->end()) //not found
+    PatchMap::iterator found = mPatches.find(mod);
+    if(found == mPatches.end()) //not found
         return;
     PatchInfoList & curPatchList = found.value();
 
     //get patches to save
     QList<DBGPATCHINFO> patchList;
     for(int i = 0; i < curPatchList.size(); i++)
-        if(curPatchList.at(i).second.checked)
-            patchList.push_back(curPatchList.at(i).first);
+        if(curPatchList.at(i).status.checked)
+            patchList.push_back(curPatchList.at(i).patch);
     if(!curPatchList.size() || !patchList.size())
     {
-        QMessageBox msg(QMessageBox::Information, "Information", "Nothing to patch!");
-        msg.setWindowIcon(QIcon(":/icons/images/information.png"));
+        QMessageBox msg(QMessageBox::Information, tr("Information"), tr("Nothing to patch!"));
+        msg.setWindowIcon(DIcon("information.png"));
         msg.setParent(this, Qt::Dialog);
         msg.setWindowFlags(msg.windowFlags() & (~Qt::WindowContextHelpButtonHint));
         msg.exec();
@@ -454,10 +453,7 @@ void PatchDialog::on_btnPatchFile_clicked()
     char szModName[MAX_PATH] = "";
     if(!DbgFunctions()->ModPathFromAddr(DbgFunctions()->ModBaseFromName(mod.toUtf8().constData()), szModName, MAX_PATH))
     {
-        QMessageBox msg(QMessageBox::Critical, "Error!", "Failed to get module filename...");
-        msg.setWindowIcon(QIcon(":/icons/images/compile-error.png"));
-        msg.setWindowFlags(msg.windowFlags() & (~Qt::WindowContextHelpButtonHint));
-        msg.exec();
+        SimpleErrorBox(this, tr("Error!"), tr("Failed to get module filename..."));
         return;
     }
 
@@ -469,7 +465,7 @@ void PatchDialog::on_btnPatchFile_clicked()
     strcpy_s(szDirName, szModName);
     szDirName[len] = '\0';
 
-    QString filename = QFileDialog::getSaveFileName(this, "Save file", szDirName, "All files (*.*)");
+    QString filename = QFileDialog::getSaveFileName(this, tr("Save file"), szDirName, tr("All files (*.*)"));
     if(!filename.length())
         return;
     filename = QDir::toNativeSeparators(filename); //convert to native path format (with backlashes)
@@ -483,14 +479,11 @@ void PatchDialog::on_btnPatchFile_clicked()
     delete [] dbgPatchList;
     if(patched == -1)
     {
-        QMessageBox msg(QMessageBox::Critical, "Error!", QString("Failed to save patched file (" + QString(error) + ")"));
-        msg.setWindowIcon(QIcon(":/icons/images/compile-error.png"));
-        msg.setWindowFlags(msg.windowFlags() & (~Qt::WindowContextHelpButtonHint));
-        msg.exec();
+        SimpleErrorBox(this, tr("Error!"), tr("Failed to save patched file (%1)").arg(error));
         return;
     }
-    QMessageBox msg(QMessageBox::Information, "Information", QString().sprintf("%d/%d patch(es) applied!", patched, patchList.size()));
-    msg.setWindowIcon(QIcon(":/icons/images/information.png"));
+    QMessageBox msg(QMessageBox::Information, tr("Information"), tr("%1/%2 patch(es) applied!").arg(patched).arg(patchList.size()));
+    msg.setWindowIcon(DIcon("information.png"));
     msg.setParent(this, Qt::Dialog);
     msg.setWindowFlags(msg.windowFlags() & (~Qt::WindowContextHelpButtonHint));
     msg.exec();
@@ -498,25 +491,10 @@ void PatchDialog::on_btnPatchFile_clicked()
 
 void PatchDialog::on_btnImport_clicked()
 {
-    QString filename = QFileDialog::getOpenFileName(this, tr("Open patch"), "", tr("Patch files (*.1337)"));
-    if(!filename.length())
-        return;
-    filename = QDir::toNativeSeparators(filename); //convert to native path format (with backlashes)
-    QFile file(filename);
-    file.open(QFile::ReadOnly | QFile::Text);
-    QTextStream in(&file);
-    QString patch = in.readAll();
-    file.close();
-    patch = patch.replace("\r\n", "\n");
-    QStringList lines = patch.split("\n", QString::SkipEmptyParts);
-    if(!lines.size())
-    {
-        QMessageBox msg(QMessageBox::Critical, "Error!", QString("The patch file is empty..."));
-        msg.setWindowIcon(QIcon(":/icons/images/compile-error.png"));
-        msg.setWindowFlags(msg.windowFlags() & (~Qt::WindowContextHelpButtonHint));
-        msg.exec();
-        return;
-    }
+    QStringList filenamelist = QFileDialog::getOpenFileNames(this, tr("Open patch"), "", tr("Patch files (*.1337)"));
+    int patched = 0;
+    bool bBadOriginal = false;
+    bool bAlreadyDone = false;
 
     typedef struct _IMPORTSTATUS
     {
@@ -525,66 +503,84 @@ void PatchDialog::on_btnImport_clicked()
     } IMPORTSTATUS;
     QList<QPair<DBGPATCHINFO, IMPORTSTATUS>> patchList;
     DBGPATCHINFO curPatch;
-    dsint modbase = 0;
-    bool bBadOriginal = false;
-    bool bAlreadyDone = false;
-    for(int i = 0; i < lines.size(); i++)
+
+    for(const auto & filename1 : filenamelist)
     {
-        ULONGLONG rva;
-        unsigned int oldbyte;
-        unsigned int newbyte;
-        QString curLine = lines.at(i);
-        if(curLine.startsWith(">")) //module
+        if(!filename1.length())
+            continue;
+        QString filename = QDir::toNativeSeparators(filename1); //convert to native path format (with backlashes)
+        QFile file(filename);
+        file.open(QFile::ReadOnly | QFile::Text);
+        QTextStream in(&file);
+        QString patch = in.readAll();
+        file.close();
+        patch = patch.replace("\r\n", "\n");
+        QStringList lines = patch.split("\n", QString::SkipEmptyParts);
+        if(!lines.size())
         {
-            strcpy_s(curPatch.mod, curLine.toUtf8().constData() + 1);
-            modbase = DbgFunctions()->ModBaseFromName(curPatch.mod);
+            SimpleErrorBox(this, tr("Error!"), tr("The patch file is empty..."));
             continue;
         }
-        if(!modbase)
-            continue;
-        curLine = curLine.replace(" ", "");
-        if(sscanf_s(curLine.toUtf8().constData(), "%llX:%X->%X", &rva, &oldbyte, &newbyte) != 3)
+
+        dsint modbase = 0;
+        for(int i = 0; i < lines.size(); i++)
         {
-            QMessageBox msg(QMessageBox::Critical, "Error!", QString("Patch file format is incorrect..."));
-            msg.setWindowIcon(QIcon(":/icons/images/compile-error.png"));
-            msg.setWindowFlags(msg.windowFlags() & (~Qt::WindowContextHelpButtonHint));
-            msg.exec();
-            return;
+            ULONGLONG rva;
+            unsigned int oldbyte;
+            unsigned int newbyte;
+            QString curLine = lines.at(i);
+            if(curLine.startsWith(">")) //module
+            {
+                strcpy_s(curPatch.mod, curLine.toUtf8().constData() + 1);
+                modbase = DbgFunctions()->ModBaseFromName(curPatch.mod);
+                continue;
+            }
+            if(!modbase)
+                continue;
+            curLine = curLine.replace(" ", "");
+            if(sscanf_s(curLine.toUtf8().constData(), "%llX:%X->%X", &rva, &oldbyte, &newbyte) != 3)
+            {
+                //File format is error. Don't continue processing this file
+                SimpleErrorBox(this, tr("Error!"), tr("Patch file format is incorrect..."));
+                break;
+            }
+            oldbyte &= 0xFF;
+            newbyte &= 0xFF;
+            curPatch.addr = rva + modbase;
+            if(!DbgMemIsValidReadPtr(curPatch.addr))
+                continue;
+            unsigned char checkbyte = 0;
+            DbgMemRead(curPatch.addr, &checkbyte, sizeof(checkbyte));
+            IMPORTSTATUS status;
+            status.alreadypatched = (checkbyte == newbyte);
+            status.badoriginal = (checkbyte != oldbyte);
+            if(status.alreadypatched)
+                bAlreadyDone = true;
+            else if(status.badoriginal)
+                bBadOriginal = true;
+            curPatch.oldbyte = oldbyte;
+            curPatch.newbyte = newbyte;
+            patchList.push_back(QPair<DBGPATCHINFO, IMPORTSTATUS>(curPatch, status));
         }
-        oldbyte &= 0xFF;
-        newbyte &= 0xFF;
-        curPatch.addr = rva + modbase;
-        if(!DbgMemIsValidReadPtr(curPatch.addr))
-            continue;
-        unsigned char checkbyte = 0;
-        DbgMemRead(curPatch.addr, &checkbyte, sizeof(checkbyte));
-        IMPORTSTATUS status;
-        status.alreadypatched = (checkbyte == newbyte);
-        status.badoriginal = (checkbyte != oldbyte);
-        if(status.alreadypatched)
-            bAlreadyDone = true;
-        else if(status.badoriginal)
-            bBadOriginal = true;
-        curPatch.oldbyte = oldbyte;
-        curPatch.newbyte = newbyte;
-        patchList.push_back(QPair<DBGPATCHINFO, IMPORTSTATUS>(curPatch, status));
     }
 
+    //Check if any patch exists
     if(!patchList.size())
     {
-        QMessageBox msg(QMessageBox::Information, "Information", QString().sprintf("No patches to apply in the current process."));
-        msg.setWindowIcon(QIcon(":/icons/images/information.png"));
+        QMessageBox msg(QMessageBox::Information, tr("Information"), tr("No patches to apply in the current process."));
+        msg.setWindowIcon(DIcon("information.png"));
         msg.setParent(this, Qt::Dialog);
         msg.setWindowFlags(msg.windowFlags() & (~Qt::WindowContextHelpButtonHint));
         msg.exec();
         return;
     }
 
+    //Warn if some are already patched
     bool bUndoPatched = false;
     if(bAlreadyDone)
     {
-        QMessageBox msg(QMessageBox::Question, "Question", "Some patches are already applied.\n\nDo you want to remove these patches?", QMessageBox::Yes | QMessageBox::No);
-        msg.setWindowIcon(QIcon(":/icons/images/question.png"));
+        QMessageBox msg(QMessageBox::Question, tr("Question"), tr("Some patches are already applied.\n\nDo you want to remove these patches?"), QMessageBox::Yes | QMessageBox::No);
+        msg.setWindowIcon(DIcon("question.png"));
         msg.setParent(this, Qt::Dialog);
         msg.setWindowFlags(msg.windowFlags() & (~Qt::WindowContextHelpButtonHint));
         if(msg.exec() == QMessageBox::Yes)
@@ -594,15 +590,15 @@ void PatchDialog::on_btnImport_clicked()
     bool bPatchBadOriginals = false;
     if(bBadOriginal)
     {
-        QMessageBox msg(QMessageBox::Question, "Question", "Some bytes do not match the original in the patch file.\n\nDo you want to apply these patches anyway?", QMessageBox::Yes | QMessageBox::No);
-        msg.setWindowIcon(QIcon(":/icons/images/question.png"));
+        QMessageBox msg(QMessageBox::Question, tr("Question"), tr("Some bytes do not match the original in the patch file.\n\nDo you want to apply these patches anyway?"), QMessageBox::Yes | QMessageBox::No);
+        msg.setWindowIcon(DIcon("question.png"));
         msg.setParent(this, Qt::Dialog);
         msg.setWindowFlags(msg.windowFlags() & (~Qt::WindowContextHelpButtonHint));
         if(msg.exec() == QMessageBox::Yes)
             bPatchBadOriginals = true;
     }
 
-    int patched = 0;
+    //Apply all of the patches
     for(int i = 0; i < patchList.size(); i++)
     {
         if(!bPatchBadOriginals && patchList.at(i).second.badoriginal)
@@ -623,8 +619,8 @@ void PatchDialog::on_btnImport_clicked()
     updatePatches();
     GuiUpdateAllViews();
 
-    QMessageBox msg(QMessageBox::Information, "Information", QString().sprintf("%d/%d patch(es) applied!", patched, patchList.size()));
-    msg.setWindowIcon(QIcon(":/icons/images/information.png"));
+    QMessageBox msg(QMessageBox::Information, tr("Information"), tr("%1/%2 patch(es) applied!").arg(patched).arg(patchList.size()));
+    msg.setWindowIcon(DIcon("information.png"));
     msg.setParent(this, Qt::Dialog);
     msg.setWindowFlags(msg.windowFlags() & (~Qt::WindowContextHelpButtonHint));
     msg.exec();
@@ -632,18 +628,24 @@ void PatchDialog::on_btnImport_clicked()
 
 void PatchDialog::on_btnExport_clicked()
 {
-    if(!mPatches->size())
+    if(!mPatches.size())
         return;
 
     QString filename = QFileDialog::getSaveFileName(this, tr("Save patch"), "", tr("Patch files (*.1337)"));
     if(!filename.length())
         return;
     filename = QDir::toNativeSeparators(filename); //convert to native path format (with backlashes)
+    if(filename.endsWith(QString(".1337")))
+        saveAs1337(filename);
+    // TODO: C program source
+}
 
+void PatchDialog::saveAs1337(const QString & filename)
+{
     QStringList lines;
 
     int patches = 0;
-    for(PatchMap::iterator i = mPatches->begin(); i != mPatches->end(); ++i)
+    for(PatchMap::iterator i = mPatches.begin(); i != mPatches.end(); ++i)
     {
         const PatchInfoList & curPatchList = i.value();
         bool bModPlaced = false;
@@ -652,23 +654,23 @@ void PatchDialog::on_btnExport_clicked()
             continue;
         for(int j = 0; j < curPatchList.size(); j++)
         {
-            if(!curPatchList.at(j).second.checked) //skip unchecked patches
+            if(!curPatchList.at(j).status.checked) //skip unchecked patches
                 continue;
             if(!bModPlaced)
             {
                 lines.push_back(">" + i.key());
                 bModPlaced = true;
             }
-            QString addrText = QString("%1").arg(curPatchList.at(j).first.addr - modbase, sizeof(dsint) * 2, 16, QChar('0')).toUpper();
-            lines.push_back(addrText + QString().sprintf(":%.2X->%.2X", curPatchList.at(j).first.oldbyte, curPatchList.at(j).first.newbyte));
+            QString addrText = ToPtrString(curPatchList.at(j).patch.addr - modbase);
+            lines.push_back(addrText + QString().sprintf(":%.2X->%.2X", curPatchList.at(j).patch.oldbyte, curPatchList.at(j).patch.newbyte));
             patches++;
         }
     }
 
     if(!lines.size())
     {
-        QMessageBox msg(QMessageBox::Information, "Information", QString().sprintf("No patches to export."));
-        msg.setWindowIcon(QIcon(":/icons/images/information.png"));
+        QMessageBox msg(QMessageBox::Information, tr("Information"), tr("No patches to export."));
+        msg.setWindowIcon(DIcon("information.png"));
         msg.setParent(this, Qt::Dialog);
         msg.setWindowFlags(msg.windowFlags() & (~Qt::WindowContextHelpButtonHint));
         msg.exec();
@@ -681,8 +683,8 @@ void PatchDialog::on_btnExport_clicked()
     file.write(text.toUtf8().constData(), text.length());
     file.close();
 
-    QMessageBox msg(QMessageBox::Information, "Information", QString().sprintf("%d patch(es) exported!", patches));
-    msg.setWindowIcon(QIcon(":/icons/images/information.png"));
+    QMessageBox msg(QMessageBox::Information, tr("Information"), tr("%1 patch(es) exported!").arg(patches));
+    msg.setWindowIcon(DIcon("information.png"));
     msg.setParent(this, Qt::Dialog);
     msg.setWindowFlags(msg.windowFlags() & (~Qt::WindowContextHelpButtonHint));
     msg.exec();

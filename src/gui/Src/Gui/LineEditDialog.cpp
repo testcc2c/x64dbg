@@ -5,19 +5,22 @@ LineEditDialog::LineEditDialog(QWidget* parent) : QDialog(parent), ui(new Ui::Li
 {
     ui->setupUi(this);
     setModal(true);
-#if QT_VERSION < QT_VERSION_CHECK(5,0,0)
-    setWindowFlags(Qt::Dialog | Qt::WindowSystemMenuHint | Qt::WindowTitleHint | Qt::MSWindowsFixedSizeDialogHint);
-#endif
-    setFixedSize(this->size()); //fixed size
+    setWindowFlags(windowFlags() & ~Qt::WindowContextHelpButtonHint | Qt::MSWindowsFixedSizeDialogHint);
     setModal(true); //modal window
     ui->checkBox->hide();
     bChecked = false;
     this->fixed_size = 0;
+    ui->label->setVisible(false);
 }
 
 LineEditDialog::~LineEditDialog()
 {
     delete ui;
+}
+
+void LineEditDialog::selectAllText()
+{
+    ui->textEdit->selectAll();
 }
 
 void LineEditDialog::setCursorPosition(int position)
@@ -28,13 +31,19 @@ void LineEditDialog::setCursorPosition(int position)
 void LineEditDialog::ForceSize(unsigned int size)
 {
     this->fixed_size = size;
-
+    if(this->fixed_size)
+        ui->label->setVisible(true);
 }
 
 void LineEditDialog::setText(const QString & text)
 {
     ui->textEdit->setText(text);
     ui->textEdit->selectAll();
+}
+
+void LineEditDialog::setPlaceholderText(const QString & text)
+{
+    ui->textEdit->setPlaceholderText(text);
 }
 
 void LineEditDialog::enableCheckBox(bool bEnable)
@@ -68,7 +77,7 @@ void LineEditDialog::on_textEdit_textChanged(const QString & arg1)
             int ct = arg1.size() - (int) this->fixed_size;
             if(ct > 0)
                 symbolct = "+";
-            ui->label->setText(QString("<font color='red'>") + QString("CT: ") + symbolct + QString::number(ct) + QString("</font>"));
+            ui->label->setText(tr("<font color='red'>CT: %1%2</font>").arg(symbolct).arg(ct));
         }
         else
         {
@@ -81,4 +90,9 @@ void LineEditDialog::on_textEdit_textChanged(const QString & arg1)
 void LineEditDialog::on_checkBox_toggled(bool checked)
 {
     bChecked = checked;
+}
+
+void LineEditDialog::setTextMaxLength(int length)
+{
+    ui->textEdit->setMaxLength(length);
 }

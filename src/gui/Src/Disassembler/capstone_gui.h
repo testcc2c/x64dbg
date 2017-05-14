@@ -5,6 +5,7 @@
 #include "RichTextPainter.h"
 #include "Configuration.h"
 #include <map>
+#include <QHash>
 #include <QtCore>
 
 class CapstoneTokenizer
@@ -20,8 +21,6 @@ public:
         //general instruction parts
         Prefix,
         Uncategorized,
-        Address, //jump/call destinations or displacements inside memory
-        Value,
         //mnemonics
         MnemonicNormal,
         MnemonicPushPop,
@@ -32,6 +31,10 @@ public:
         MnemonicNop,
         MnemonicFar,
         MnemonicInt3,
+        MnemonicUnusual,
+        //values
+        Address, //jump/call destinations or displacements inside memory
+        Value,
         //memory
         MemorySize,
         MemorySegment,
@@ -47,7 +50,9 @@ public:
         MmxRegister,
         XmmRegister,
         YmmRegister,
-        ZmmRegister
+        ZmmRegister,
+        //last
+        Last
     };
 
     struct TokenValue
@@ -62,7 +67,8 @@ public:
         }
 
         TokenValue() :
-            size(0)
+            size(0),
+            value(0)
         {
         }
     };
@@ -130,25 +136,34 @@ public:
             else
                 this->flags = RichTextPainter::FlagNone;
         }
+
+        TokenColor()
+            : TokenColor("", "")
+        {
+        }
     };
 
     CapstoneTokenizer(int maxModuleLength);
     bool Tokenize(duint addr, const unsigned char* data, int datasize, InstructionToken & instruction);
+    bool TokenizeData(const QString & datatype, const QString & data, InstructionToken & instruction);
     void UpdateConfig();
-    void SetConfig(bool bUppercase, bool bTabbedMnemonic, bool bArgumentSpaces, bool bMemorySpaces);
+    void SetConfig(bool bUppercase, bool bTabbedMnemonic, bool bArgumentSpaces, bool bMemorySpaces, bool bNoHighlightOperands, bool bNoCurrentModuleText, bool b0xPrefixValues);
     int Size() const;
     const Capstone & GetCapstone() const;
 
     static void UpdateColors();
-    static void TokenToRichText(const InstructionToken & instr, QList<RichTextPainter::CustomRichText_t> & richTextList, const SingleToken* highlightToken);
-    static bool TokenFromX(const InstructionToken & instr, SingleToken & token, int x, int charwidth);
+    static void UpdateStringPool();
+    static void TokenToRichText(const InstructionToken & instr, RichTextPainter::List & richTextList, const SingleToken* highlightToken);
+    static bool TokenFromX(const InstructionToken & instr, SingleToken & token, int x, CachedFontMetrics* fontMetrics);
     static bool IsHighlightableToken(const SingleToken & token);
     static bool TokenEquals(const SingleToken* a, const SingleToken* b, bool ignoreSize = true);
+    static void addColorName(TokenType type, QString color, QString backgroundColor);
+    static void addStringsToPool(const QString & regs);
+    static bool tokenTextPoolEquals(const QString & a, const QString & b);
 
 private:
-    static void addColorName(TokenType type, QString color, QString backgroundColor);
-
     Capstone _cp;
+    bool isNop;
     InstructionToken _inst;
     bool _success;
     int _maxModuleLength;
@@ -156,21 +171,26 @@ private:
     bool _bTabbedMnemonic;
     bool _bArgumentSpaces;
     bool _bMemorySpaces;
+    bool _bNoHighlightOperands;
+    bool _bNoCurrentModuleText;
+    bool _b0xPrefixValues;
+    TokenType _mnemonicType;
 
     void addToken(TokenType type, QString text, const TokenValue & value);
     void addToken(TokenType type, const QString & text);
     void addMemoryOperator(char operatorText);
     QString printValue(const TokenValue & value, bool expandModule, int maxModuleLength) const;
 
-    static std::map<TokenType, TokenColor> colorNamesMap;
+    static QHash<QString, int> stringPoolMap;
+    static int poolId;
 
     bool tokenizePrefix();
     bool tokenizeMnemonic();
+    bool tokenizeMnemonic(TokenType type, const QString & mnemonic);
     bool tokenizeOperand(const cs_x86_op & op);
     bool tokenizeRegOperand(const cs_x86_op & op);
     bool tokenizeImmOperand(const cs_x86_op & op);
     bool tokenizeMemOperand(const cs_x86_op & op);
-    bool tokenizeFpOperand(const cs_x86_op & op);
     bool tokenizeInvalidOperand(const cs_x86_op & op);
 };
 

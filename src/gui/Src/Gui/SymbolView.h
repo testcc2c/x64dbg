@@ -4,9 +4,13 @@
 #include <QWidget>
 #include "Bridge.h"
 
+class QMenu;
+class SearchListView;
+class QVBoxLayout;
+
 namespace Ui
 {
-class SymbolView;
+    class SymbolView;
 }
 
 class SymbolView : public QWidget
@@ -26,22 +30,33 @@ private slots:
     void updateSymbolList(int module_count, SYMBOLMODULEINFO* modules);
     void symbolFollow();
     void symbolFollowDump();
+    void symbolFollowImport();
+    void enterPressedSlot();
     void symbolContextMenu(QMenu* wMenu);
     void symbolRefreshCurrent();
-    void moduleContextMenu(const QPoint & pos);
+    void moduleContextMenu(QMenu* wMenu);
     void moduleFollow();
     void moduleEntryFollow();
     void moduleDownloadSymbols();
     void moduleDownloadAllSymbols();
     void moduleCopyPath();
+    void moduleBrowse();
     void moduleYara();
+    void moduleYaraFile();
+    void moduleSetUser();
+    void moduleSetSystem();
+    void moduleSetParty();
+    void moduleFollowMemMap();
     void toggleBreakpoint();
     void toggleBookmark();
     void refreshShortcutsSlot();
     void moduleEntropy();
+    void emptySearchResultSlot();
+    void selectionGetSlot(SELECTIONDATA* selection);
+    void moduleLoad();
+    void moduleFree();
 
 signals:
-    void showCpu();
     void showReferences();
 
 private:
@@ -50,10 +65,11 @@ private:
     QVBoxLayout* mSymbolLayout;
     QWidget* mSymbolPlaceHolder;
     SearchListView* mSearchListView;
-    StdTable* mModuleList;
+    SearchListView* mModuleList;
     QMap<QString, duint> mModuleBaseList;
     QAction* mFollowSymbolAction;
     QAction* mFollowSymbolDumpAction;
+    QAction* mFollowSymbolImportAction;
     QAction* mToggleBreakpoint;
     QAction* mToggleBookmark;
     QAction* mFollowModuleAction;
@@ -62,7 +78,15 @@ private:
     QAction* mDownloadAllSymbolsAction;
     QAction* mCopyPathAction;
     QAction* mYaraAction;
+    QAction* mYaraFileAction;
     QAction* mEntropyAction;
+    QAction* mModSetUserAction;
+    QAction* mModSetSystemAction;
+    QAction* mModSetPartyAction;
+    QAction* mBrowseInExplorer;
+    QAction* mFollowInMemMap;
+    QAction* mLoadLib;
+    QAction* mFreeLib;
 
     static void cbSymbolEnum(SYMBOLINFO* symbol, void* user);
 };

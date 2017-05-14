@@ -10,11 +10,12 @@ class ReferenceView : public SearchListView
     Q_OBJECT
 
 public:
-    ReferenceView();
+    ReferenceView(bool sourceView = false, QWidget* parent = nullptr);
     void setupContextMenu();
+    void connectBridge();
     void disconnectBridge();
 
-private slots:
+public slots:
     void addColumnAt(int width, QString title);
     void setRowCount(dsint count);
     void setCellContent(int r, int c, QString s);
@@ -27,22 +28,42 @@ private slots:
     void followApiAddress();
     void followGenericAddress();
     void toggleBreakpoint();
+    void setBreakpointOnAllCommands();
+    void removeBreakpointOnAllCommands();
+    void setBreakpointOnAllApiCalls();
+    void removeBreakpointOnAllApiCalls();
     void toggleBookmark();
     void refreshShortcutsSlot();
+    void referenceSetProgressSlot(int progress);
+    void referenceSetCurrentTaskProgressSlot(int progress, QString taskTitle);
+    void searchSelectionChanged(int index);
 
 signals:
     void showCpu();
 
 private:
-    QProgressBar* mSearchProgress;
+    QProgressBar* mSearchTotalProgress;
+    QProgressBar* mSearchCurrentTaskProgress;
     QAction* mFollowAddress;
     QAction* mFollowDumpAddress;
     QAction* mFollowApiAddress;
     QAction* mToggleBreakpoint;
     QAction* mToggleBookmark;
-    bool mFollowDumpDefault;
-    QLabel* mCountLabel;
+    QAction* mSetBreakpointOnAllCommands;
+    QAction* mRemoveBreakpointOnAllCommands;
+    QAction* mSetBreakpointOnAllApiCalls;
+    QAction* mRemoveBreakpointOnAllApiCalls;
+    QLabel* mCountTotalLabel;
 
+    enum BPSetAction
+    {
+        Enable,
+        Disable,
+        Toggle,
+        Remove
+    };
+
+    void setBreakpointAt(int row, BPSetAction action);
     dsint apiAddressFromString(const QString & s);
 };
 

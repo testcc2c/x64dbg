@@ -1,22 +1,43 @@
 #include "WordEditDialog.h"
 #include "ui_WordEditDialog.h"
+#include "ValidateExpressionThread.h"
+#include "StringUtil.h"
 
-WordEditDialog::WordEditDialog(QWidget* parent) : QDialog(parent), ui(new Ui::WordEditDialog)
+WordEditDialog::WordEditDialog(QWidget* parent)
+    : QDialog(parent),
+      ui(new Ui::WordEditDialog),
+      mHexLineEditPos(0),
+      mSignedEditPos(0),
+      mUnsignedEditPos(0)
 {
     ui->setupUi(this);
-#if QT_VERSION < QT_VERSION_CHECK(5,0,0)
-    setWindowFlags(Qt::Dialog | Qt::WindowSystemMenuHint | Qt::WindowTitleHint | Qt::MSWindowsFixedSizeDialogHint);
-#endif
+    setWindowFlags(windowFlags() & ~Qt::WindowContextHelpButtonHint | Qt::MSWindowsFixedSizeDialogHint);
     setModal(true);
 
+    // Set up default validators for numerical input
+    ui->signedLineEdit->setValidator(new QRegExpValidator(QRegExp("^-?\\d*(\\d+)?$"), this));// Optional negative, 0-9
+    ui->unsignedLineEdit->setValidator(new QRegExpValidator(QRegExp("^\\d*(\\d+)?$"), this));// No signs, 0-9
+
     mValidateThread = new ValidateExpressionThread(this);
+    mValidateThread->setOnExpressionChangedCallback(std::bind(&WordEditDialog::validateExpression, this, std::placeholders::_1));
+
     connect(mValidateThread, SIGNAL(expressionChanged(bool, bool, dsint)), this, SLOT(expressionChanged(bool, bool, dsint)));
-    connect(ui->expressionLineEdit, SIGNAL(textEdited(QString)), mValidateThread, SLOT(textChanged(QString)));
+    connect(ui->expressionLineEdit, SIGNAL(textChanged(QString)), mValidateThread, SLOT(textChanged(QString)));
     mWord = 0;
+}
+
+void WordEditDialog::validateExpression(QString expression)
+{
+    duint value;
+    bool validExpression = DbgFunctions()->ValFromString(expression.toUtf8().constData(), &value);
+    bool validPointer = validExpression && DbgMemIsValidReadPtr(value);
+    this->mValidateThread->emitExpressionChanged(validExpression, validPointer, value);
 }
 
 WordEditDialog::~WordEditDialog()
 {
+    mValidateThread->stop();
+    mValidateThread->wait();
     delete ui;
 }
 
@@ -54,9 +75,9 @@ void WordEditDialog::expressionChanged(bool validExpression, bool validPointer, 
     if(validExpression)
     {
         ui->expressionLineEdit->setStyleSheet("");
-        ui->unsignedLineEdit->setStyleSheet("");
         ui->signedLineEdit->setStyleSheet("");
-        ui->buttons->button(QDialogButtonBox::Ok)->setEnabled(true);
+        ui->unsignedLineEdit->setStyleSheet("");
+        ui->btnOk->setEnabled(true);
 
         //hex
         mWord = value;
@@ -78,23 +99,25 @@ void WordEditDialog::expressionChanged(bool validExpression, bool validPointer, 
         hex[2] = word[1];
         hex[3] = word[0];
 #endif //_WIN64
-        ui->hexLineEdit->setText(QString("%1").arg(hexWord, sizeof(duint) * 2, 16, QChar('0')).toUpper());
-        //signed
+
+        // Save the original index for inputs
+        saveCursorPositions();
+
+        // Byte edit line
+        ui->hexLineEdit->setText(ToPtrString(hexWord));
+        // Signed edit
         ui->signedLineEdit->setText(QString::number((dsint)mWord));
-        //unsigned
+        // Unsigned edit
         ui->unsignedLineEdit->setText(QString::number((duint)mWord));
+
+        // Use the same indices, but with different text
+        restoreCursorPositions();
     }
     else
     {
         ui->expressionLineEdit->setStyleSheet("border: 1px solid red");
-        ui->buttons->button(QDialogButtonBox::Ok)->setEnabled(false);
+        ui->btnOk->setEnabled(false);
     }
-}
-
-void WordEditDialog::on_expressionLineEdit_textChanged(const QString & arg1)
-{
-    Q_UNUSED(arg1);
-    ui->buttons->button(QDialogButtonBox::Ok)->setEnabled(false);
 }
 
 void WordEditDialog::on_signedLineEdit_textEdited(const QString & arg1)
@@ -103,13 +126,13 @@ void WordEditDialog::on_signedLineEdit_textEdited(const QString & arg1)
     if(sscanf_s(arg1.toUtf8().constData(), "%lld", &value) == 1)
     {
         ui->signedLineEdit->setStyleSheet("");
-        ui->buttons->button(QDialogButtonBox::Ok)->setEnabled(true);
-        ui->expressionLineEdit->setText(QString("%1").arg((duint)value, sizeof(duint) * 2, 16, QChar('0')).toUpper());
+        ui->btnOk->setEnabled(true);
+        ui->expressionLineEdit->setText(ToPtrString((duint)value));
     }
     else
     {
         ui->signedLineEdit->setStyleSheet("border: 1px solid red");
-        ui->buttons->button(QDialogButtonBox::Ok)->setEnabled(false);
+        ui->btnOk->setEnabled(false);
     }
 }
 
@@ -119,12 +142,28 @@ void WordEditDialog::on_unsignedLineEdit_textEdited(const QString & arg1)
     if(sscanf_s(arg1.toUtf8().constData(), "%llu", &value) == 1)
     {
         ui->unsignedLineEdit->setStyleSheet("");
-        ui->buttons->button(QDialogButtonBox::Ok)->setEnabled(true);
-        ui->expressionLineEdit->setText(QString("%1").arg((duint)value, sizeof(duint) * 2, 16, QChar('0')).toUpper());
+        ui->btnOk->setEnabled(true);
+        ui->expressionLineEdit->setText(ToPtrString((duint)value));
     }
     else
     {
         ui->unsignedLineEdit->setStyleSheet("border: 1px solid red");
-        ui->buttons->button(QDialogButtonBox::Ok)->setEnabled(false);
+        ui->btnOk->setEnabled(false);
     }
+}
+
+void WordEditDialog::saveCursorPositions()
+{
+    // Save the user's cursor index
+    mHexLineEditPos = ui->hexLineEdit->cursorPosition();
+    mSignedEditPos = ui->signedLineEdit->cursorPosition();
+    mUnsignedEditPos = ui->unsignedLineEdit->cursorPosition();
+}
+
+void WordEditDialog::restoreCursorPositions()
+{
+    // Load the old cursor index (bounds checking is automatic)
+    ui->hexLineEdit->setCursorPosition(mHexLineEditPos);
+    ui->signedLineEdit->setCursorPosition(mSignedEditPos);
+    ui->unsignedLineEdit->setCursorPosition(mUnsignedEditPos);
 }

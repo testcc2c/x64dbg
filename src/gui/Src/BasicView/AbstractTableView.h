@@ -11,46 +11,37 @@
 #include "StringUtil.h"
 #include "Configuration.h"
 #include "MenuBuilder.h"
+#include "MiscUtil.h"
+#include "ActionHelpers.h"
+
+class CachedFontMetrics;
 
 //Hacky class that fixes a really annoying cursor problem
 class AbstractTableScrollBar : public QScrollBar
 {
     Q_OBJECT
 public:
-    AbstractTableScrollBar(QScrollBar* scrollbar)
-    {
-        setOrientation(scrollbar->orientation());
-        setParent(scrollbar->parentWidget());
-    }
-
-    void enterEvent(QEvent* event)
-    {
-        Q_UNUSED(event);
-        QApplication::setOverrideCursor(Qt::ArrowCursor);
-    }
-
-    void leaveEvent(QEvent* event)
-    {
-        Q_UNUSED(event);
-        QApplication::restoreOverrideCursor();
-    }
+    AbstractTableScrollBar(QScrollBar* scrollbar);
+    void enterEvent(QEvent* event);
+    void leaveEvent(QEvent* event);
 };
 
-class AbstractTableView : public QAbstractScrollArea
+class AbstractTableView;
+class AbstractTableView : public QAbstractScrollArea, public ActionHelper<AbstractTableView>
 {
     Q_OBJECT
 
 public:
-    enum GuiState_t {NoState, ReadyToResize, ResizeColumnState, HeaderButtonPressed};
+    enum GuiState_t {NoState, ReadyToResize, ResizeColumnState, HeaderButtonPressed, HeaderButtonReordering};
 
     // Constructor
     explicit AbstractTableView(QWidget* parent = 0);
+    ~AbstractTableView();
 
     // Configuration
     virtual void Initialize();
     virtual void updateColors();
     virtual void updateFonts();
-    virtual void updateShortcuts();
 
     // Pure Virtual Methods
     virtual QString paintContent(QPainter* painter, dsint rowBase, int rowOffset, int col, int x, int y, int w, int h) = 0;
@@ -62,6 +53,7 @@ public:
     void mouseMoveEvent(QMouseEvent* event);
     void mousePressEvent(QMouseEvent* event);
     void mouseReleaseEvent(QMouseEvent* event);
+    void mouseDoubleClickEvent(QMouseEvent* event);
     void wheelEvent(QWheelEvent* event);
     void resizeEvent(QResizeEvent* event);
     void keyPressEvent(QKeyEvent* event);
@@ -81,16 +73,24 @@ public:
     int getViewableRowsCount();
     virtual int getLineToPrintcount();
 
+    struct SortBy
+    {
+        typedef std::function<bool(const QString &, const QString &)> t;
+        static bool AsText(const QString & a, const QString & b);
+        static bool AsInt(const QString & a, const QString & b);
+        static bool AsHex(const QString & a, const QString & b);
+    };
+
     // New Columns/New Size
-    virtual void addColumnAt(int width, QString title, bool isClickable);
+    virtual void addColumnAt(int width, const QString & title, bool isClickable, SortBy::t sortFn = SortBy::AsText);
     virtual void setRowCount(dsint count);
     virtual void deleteAllColumns();
-    void setColTitle(int index, QString title);
+    void setColTitle(int index, const QString & title);
     QString getColTitle(int index);
 
     // Getter & Setter
-    dsint getRowCount();
-    int getColumnCount();
+    dsint getRowCount() const;
+    int getColumnCount() const;
     int getRowHeight();
     int getColumnWidth(int index);
     void setColumnWidth(int index, int width);
@@ -101,6 +101,14 @@ public:
     void setNbrOfLineToPrint(int parNbrOfLineToPrint);
     void setShowHeader(bool show);
     int getCharWidth();
+    bool getColumnHidden(int col);
+    void setColumnHidden(int col, bool hidden);
+    SortBy::t getColumnSortBy(int idx) const;
+
+    // UI customization
+    void loadColumnFromConfig(const QString & viewName);
+    void saveColumnToConfig();
+    static void setupColumnConfigDefaultValue(QMap<QString, duint> & map, const QString & viewName, int columnCount);
 
     // Content drawing control
     bool getDrawDebugOnly();
@@ -126,10 +134,11 @@ public slots:
     void slot_updateColors();
     void slot_updateFonts();
     void slot_updateShortcuts();
+    void slot_close();
 
     // Update/Reload/Refresh/Repaint
     virtual void reloadData();
-    void repaint();
+    void updateViewport();
 
     // ScrollBar Management
     void vertSliderActionSlot(int action);
@@ -152,8 +161,10 @@ private:
     typedef struct _Column_t
     {
         int width;
+        bool hidden;
         HeaderButton_t header;
         QString title;
+        SortBy::t sortFunction;
     } Column_t;
 
     typedef struct _Header_t
@@ -177,9 +188,13 @@ private:
 
     QList<Column_t> mColumnList;
 
+    QList<int> mColumnOrder;
+    int mReorderStartX;
+    int mHoveredColumnDisplayIndex;
+
     dsint mRowCount;
 
-    int mMouseWheelScrollDelta;
+    static int mMouseWheelScrollDelta;
 
     dsint mTableOffset;
     Header_t mHeader;
@@ -192,6 +207,8 @@ private:
 
     ScrollBar64_t mScrollBarAttributes;
 
+    int getColumnDisplayIndexFromX(int x);
+    friend class ColumnReorderDialog;
 protected:
     bool mAllowPainting;
     bool mDrawDebugOnly;
@@ -202,96 +219,11 @@ protected:
     QColor separatorColor;
     QColor headerTextColor;
     QColor selectionColor;
+    QString mViewName;
 
-    //action helpers
-private:
-    struct ActionShortcut
-    {
-        QAction* action;
-        const char* shortcut;
-
-        ActionShortcut(QAction* action, const char* shortcut)
-            : action(action),
-              shortcut(shortcut)
-        {
-        }
-    };
-
-    std::vector<ActionShortcut> actionShortcutPairs;
-
-    inline QAction* connectAction(QAction* action, const char* slot)
-    {
-        connect(action, SIGNAL(triggered(bool)), this, slot);
-        return action;
-    }
-
-    inline QAction* connectShortcutAction(QAction* action, const char* shortcut)
-    {
-        actionShortcutPairs.push_back(ActionShortcut(action, shortcut));
-        action->setShortcut(ConfigShortcut(shortcut));
-        action->setShortcutContext(Qt::WidgetShortcut);
-        addAction(action);
-        return action;
-    }
-
-    inline QAction* connectMenuAction(QMenu* menu, QAction* action)
-    {
-        menu->addAction(action);
-        return action;
-    }
-
-protected:
-    inline QMenu* makeMenu(const QString & title)
-    {
-        return new QMenu(title, this);
-    }
-
-    inline QMenu* makeMenu(const QIcon & icon, const QString & title)
-    {
-        QMenu* menu = new QMenu(title, this);
-        menu->setIcon(icon);
-        return menu;
-    }
-
-    inline QAction* makeAction(const QString & text, const char* slot)
-    {
-        return connectAction(new QAction(text, this), slot);
-    }
-
-    inline QAction* makeAction(const QIcon & icon, const QString & text, const char* slot)
-    {
-        return connectAction(new QAction(icon, text, this), slot);
-    }
-
-    inline QAction* makeShortcutAction(const QString & text, const char* slot, const char* shortcut)
-    {
-        return connectShortcutAction(makeAction(text, slot), shortcut);
-    }
-
-    inline QAction* makeShortcutAction(const QIcon & icon, const QString & text, const char* slot, const char* shortcut)
-    {
-        return connectShortcutAction(makeAction(icon, text, slot), shortcut);
-    }
-
-    inline QAction* makeMenuAction(QMenu* menu, const QString & text, const char* slot)
-    {
-        return connectMenuAction(menu, makeAction(text, slot));
-    }
-
-    inline QAction* makeMenuAction(QMenu* menu, const QIcon & icon, const QString & text, const char* slot)
-    {
-        return connectMenuAction(menu, makeAction(icon, text, slot));
-    }
-
-    inline QAction* makeShortcutMenuAction(QMenu* menu, const QString & text, const char* slot, const char* shortcut)
-    {
-        return connectShortcutAction(makeMenuAction(menu, text, slot), shortcut);
-    }
-
-    inline QAction* makeShortcutMenuAction(QMenu* menu, const QIcon & icon, const QString & text, const char* slot, const char* shortcut)
-    {
-        return connectShortcutAction(makeMenuAction(menu, icon, text, slot), shortcut);
-    }
+    // Font metrics
+    CachedFontMetrics* mFontMetrics;
+    void invalidateCachedFont();
 };
 
 #endif // ABSTRACTTABLEVIEW_H

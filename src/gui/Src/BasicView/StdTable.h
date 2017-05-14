@@ -24,12 +24,14 @@ public:
     void expandSelectionUpTo(int to);
     void setSingleSelection(int index);
     int getInitialSelection();
+    QList<int> getSelection();
     void selectNext();
     void selectPrevious();
     bool isSelected(int base, int offset);
+    bool scrollSelect(int offset);
 
     // Data Management
-    void addColumnAt(int width, QString title, bool isClickable, QString copyTitle = "");
+    void addColumnAt(int width, QString title, bool isClickable, QString copyTitle = "", SortBy::t sortFn = SortBy::AsText);
     void setRowCount(int count);
     void deleteAllColumns();
     void setCellContent(int r, int c, QString s);
@@ -38,6 +40,7 @@ public:
 
     //context menu helpers
     void setupCopyMenu(QMenu* copyMenu);
+    void setupCopyMenu(MenuBuilder* copyMenu);
     void setCopyMenuOnly(bool bSet, bool bDebugOnly = true);
 
 signals:
@@ -49,23 +52,30 @@ signals:
 public slots:
     void copyLineSlot();
     void copyTableSlot();
+    void copyTableResizeSlot();
+    void copyLineToLogSlot();
+    void copyTableToLogSlot();
+    void copyTableResizeToLogSlot();
     void copyEntrySlot();
     void contextMenuRequestedSlot(const QPoint & pos);
     void headerButtonPressedSlot(int col);
 
 private:
+    QString copyTable(const std::vector<int> & colWidths);
+
     class ColumnCompare
     {
     public:
-        ColumnCompare(int col, bool greater)
+        ColumnCompare(int col, bool greater, SortBy::t fn)
         {
             mCol = col;
             mGreater = greater;
+            mSortFn = fn;
         }
 
         inline bool operator()(const QList<QString> & a, const QList<QString> & b) const
         {
-            bool less = QString::compare(a.at(mCol), b.at(mCol), Qt::CaseInsensitive) < 0;
+            bool less = mSortFn(a.at(mCol), b.at(mCol));
             if(mGreater)
                 return !less;
             return less;
@@ -73,6 +83,7 @@ private:
     private:
         int mCol;
         int mGreater;
+        SortBy::t mSortFn;
     };
 
     enum GuiState_t {NoState, MultiRowsSelectionState};

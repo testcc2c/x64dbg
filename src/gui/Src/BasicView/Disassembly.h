@@ -2,14 +2,18 @@
 #define DISASSEMBLY_H
 
 #include "AbstractTableView.h"
-#include "QBeaEngine.h"
-#include "MemoryPage.h"
+#include "DisassemblyPopup.h"
+
+class CodeFoldingHelper;
+class QBeaEngine;
+class MemoryPage;
 
 class Disassembly : public AbstractTableView
 {
     Q_OBJECT
 public:
     explicit Disassembly(QWidget* parent = 0);
+    virtual ~Disassembly();
 
     // Configuration
     virtual void updateColors();
@@ -22,6 +26,7 @@ public:
     void mouseMoveEvent(QMouseEvent* event);
     void mousePressEvent(QMouseEvent* event);
     void mouseReleaseEvent(QMouseEvent* event);
+    void leaveEvent(QEvent* event) override;
 
     // Keyboard Management
     void keyPressEvent(QKeyEvent* event);
@@ -30,7 +35,7 @@ public:
     dsint sliderMovedHook(int type, dsint value, dsint delta);
 
     // Jumps Graphic
-    int paintJumpsGraphic(QPainter* painter, int x, int y, dsint addr);
+    int paintJumpsGraphic(QPainter* painter, int x, int y, dsint addr, bool isjmp);
 
     // Function Graphic
 
@@ -48,7 +53,7 @@ public:
 
     // Instructions Management
     dsint getPreviousInstructionRVA(dsint rva, duint count);
-    dsint getNextInstructionRVA(dsint rva, duint count);
+    dsint getNextInstructionRVA(dsint rva, duint count, bool isGlobal = false);
     dsint getInstructionRVA(dsint index, dsint count);
     Instruction_t DisassembleAt(dsint rva);
     Instruction_t DisassembleAt(dsint rva, dsint count);
@@ -73,8 +78,8 @@ public:
     // Public Methods
     duint rvaToVa(dsint rva);
     void disassembleClear();
-    const dsint getBase() const;
-    dsint getSize();
+    const duint getBase() const;
+    duint getSize();
     duint getTableOffsetRva();
 
     // history management
@@ -87,25 +92,37 @@ public:
     //disassemble
     void disassembleAt(dsint parVA, dsint parCIP, bool history, dsint newTableOffset);
 
-    QList<Instruction_t>* instructionsBuffer();
+    QList<Instruction_t>* instructionsBuffer(); // ugly
     const dsint baseAddress() const;
     const dsint currentEIP() const;
 
-    QString getAddrText(dsint cur_addr, char label[MAX_LABEL_SIZE]);
-    void prepareDataCount(dsint wRVA, int wCount, QList<Instruction_t>* instBuffer);
-    void prepareDataRange(dsint startRva, dsint endRva, QList<Instruction_t>* instBuffer);
+    QString getAddrText(dsint cur_addr, char label[MAX_LABEL_SIZE], bool getLabel = true);
+    void prepareDataCount(const QList<dsint> & wRVAs, QList<Instruction_t>* instBuffer);
+    void prepareDataRange(dsint startRva, dsint endRva, const std::function<bool(int, const Instruction_t &)> & disassembled);
+
+    //misc
+    void setCodeFoldingManager(CodeFoldingHelper* CodeFoldingManager);
+    void unfold(dsint rva);
+    void ShowDisassemblyPopup(duint addr, int x, int y);
+    bool hightlightToken(const CapstoneTokenizer::SingleToken & token);
+    bool isHighlightMode();
 
 signals:
     void selectionChanged(dsint parVA);
+    void selectionExpanded();
     void disassembledAt(dsint parVA, dsint parCIP, bool history, dsint newTableOffset);
+    void updateWindowTitle(QString title);
 
 public slots:
     void disassembleAt(dsint parVA, dsint parCIP);
     void debugStateChangedSlot(DBGSTATE state);
+    void selectionChangedSlot(dsint parVA);
+    void tokenizerConfigUpdatedSlot();
 
 private:
     enum GuiState_t {NoState, MultiRowsSelectionState};
-    enum GraphicDump_t {GD_Nothing, GD_FootToTop, GD_FootToBottom, GD_HeadFromTop, GD_HeadFromBottom, GD_Vert}; // GD_FootToTop = '- , GD_FootToBottom = ,- , GD_HeadFromTop = '-> , GD_HeadFromBottom = ,-> , GD_Vert = |
+    enum GraphicDump_t {GD_Nothing, GD_FootToTop, GD_FootToBottom, GD_HeadFromTop, GD_HeadFromBottom, GD_HeadFromBoth, GD_Vert, GD_VertHori}; // GD_FootToTop = '- , GD_FootToBottom = ,- , GD_HeadFromTop = '-> , GD_HeadFromBottom = ,-> , GD_HeadFromBoth = |-> , GD_Vert = | , GD_VertHori = |-
+    enum GraphicJumpDirection_t {GJD_Nothing, GJD_Up, GJD_Down };
 
     typedef struct _SelectionData_t
     {
@@ -114,12 +131,9 @@ private:
         dsint toIndex;
     } SelectionData_t;
 
-    QBeaEngine* mDisasm;
-
     SelectionData_t mSelection;
 
     bool mIsLastInstDisplayed;
-    bool mIsRunning;
 
     GuiState_t mGuiState;
 
@@ -131,11 +145,11 @@ private:
     {
         dsint va;
         dsint tableOffset;
+        QString windowTitle;
     } HistoryData_t;
 
     QList<HistoryData_t> mVaHistory;
     int mCurrentVa;
-    CapstoneTokenizer::SingleToken mHighlightToken;
 
 protected:
     // Configuration
@@ -158,15 +172,32 @@ protected:
     QColor mLabelBackgroundColor;
 
     QColor mSelectedAddressBackgroundColor;
+    QColor mTracedAddressBackgroundColor;
     QColor mSelectedAddressColor;
     QColor mAddressBackgroundColor;
     QColor mAddressColor;
+    QColor mTracedSelectedAddressBackgroundColor;
 
     QColor mBytesColor;
+    QColor mBytesBackgroundColor;
     QColor mModifiedBytesColor;
+    QColor mModifiedBytesBackgroundColor;
+    QColor mRestoredBytesColor;
+    QColor mRestoredBytesBackgroundColor;
+    QColor mByte00Color;
+    QColor mByte00BackgroundColor;
+    QColor mByte7FColor;
+    QColor mByte7FBackgroundColor;
+    QColor mByteFFColor;
+    QColor mByteFFBackgroundColor;
+    QColor mByteIsPrintColor;
+    QColor mByteIsPrintBackgroundColor;
 
     QColor mAutoCommentColor;
     QColor mAutoCommentBackgroundColor;
+
+    QColor mMnemonicBriefColor;
+    QColor mMnemonicBriefBackgroundColor;
 
     QColor mCommentColor;
     QColor mCommentBackgroundColor;
@@ -178,12 +209,26 @@ protected:
     QColor mLoopColor;
     QColor mFunctionColor;
 
+    QPen mLoopPen;
+    QPen mFunctionPen;
+    QPen mUnconditionalPen;
+    QPen mConditionalTruePen;
+    QPen mConditionalFalsePen;
+
     // Misc
     bool mRvaDisplayEnabled;
     duint mRvaDisplayBase;
     dsint mRvaDisplayPageBase;
     bool mHighlightingMode;
+    bool mPopupEnabled;
     MemoryPage* mMemPage;
+    QBeaEngine* mDisasm;
+    bool mShowMnemonicBrief;
+    XREF_INFO mXrefInfo;
+    CodeFoldingHelper* mCodeFoldingManager;
+    DisassemblyPopup mDisassemblyPopup;
+    CapstoneTokenizer::SingleToken mHighlightToken;
+    bool mPermanentHighlightingMode;
 };
 
 #endif // DISASSEMBLY_H

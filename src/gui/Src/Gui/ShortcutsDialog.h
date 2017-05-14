@@ -7,7 +7,7 @@
 
 namespace Ui
 {
-class ShortcutsDialog;
+    class ShortcutsDialog;
 }
 
 class ShortcutsDialog : public QDialog
@@ -26,6 +26,7 @@ protected slots:
 
 private slots:
     void on_btnSave_clicked();
+    void on_btnClearShortcut_clicked();
     void rejectedSlot();
 
 private:

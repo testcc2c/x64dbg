@@ -5,15 +5,20 @@
  */
 
 #include "disasm_helper.h"
-#include "value.h"
+#include "thread.h"
 #include "console.h"
 #include "memory.h"
+#include "debugger.h"
+#include "value.h"
+#include "encodemap.h"
 #include <capstone_wrapper.h>
+#include "datainst_helper.h"
 
 duint disasmback(unsigned char* data, duint base, duint size, duint ip, int n)
 {
     int i;
     duint abuf[131], addr, back, cmdsize;
+    memset(abuf, 0, sizeof(abuf));
     unsigned char* pdata;
 
     // Reset Disasm Structure
@@ -106,42 +111,29 @@ duint disasmnext(unsigned char* data, duint base, duint size, duint ip, int n)
     return ip;
 }
 
-const char* disasmtext(duint addr)
+static void HandleCapstoneOperand(Capstone & cp, int opindex, DISASM_ARG* arg, bool getregs)
 {
-    unsigned char buffer[MAX_DISASM_BUFFER] = "";
-    DbgMemRead(addr, buffer, sizeof(buffer));
-    Capstone cp;
-    static char instruction[64] = "";
-    if(!cp.Disassemble(addr, buffer))
-        strcpy_s(instruction, "???");
-    else
-        sprintf_s(instruction, "%s %s", cp.GetInstr()->mnemonic, cp.GetInstr()->op_str);
-    return instruction;
-}
-
-static void HandleCapstoneOperand(Capstone & cp, int opindex, DISASM_ARG* arg)
-{
-    const cs_x86 & x86 = cp.x86();
-    const cs_x86_op & op = x86.operands[opindex];
+    auto value = cp.ResolveOpValue(opindex, [&cp, getregs](x86_reg reg)
+    {
+        auto regName = getregs ? cp.RegName(reg) : nullptr;
+        return regName ? getregister(nullptr, regName) : 0; //TODO: temporary needs enums + caching
+    });
+    const auto & op = cp[opindex];
     arg->segment = SEG_DEFAULT;
     strcpy_s(arg->mnemonic, cp.OperandText(opindex).c_str());
     switch(op.type)
     {
     case X86_OP_REG:
     {
-        const char* regname = cp.RegName((x86_reg)op.reg);
         arg->type = arg_normal;
-        duint value;
-        if(!valfromstring(regname, &value, true, true))
-            value = 0;
-        arg->constant = arg->value = value;
+        arg->value = value;
     }
     break;
 
     case X86_OP_IMM:
     {
         arg->type = arg_normal;
-        arg->constant = arg->value = (duint)op.imm;
+        arg->constant = arg->value = value;
     }
     break;
 
@@ -149,48 +141,57 @@ static void HandleCapstoneOperand(Capstone & cp, int opindex, DISASM_ARG* arg)
     {
         arg->type = arg_memory;
         const x86_op_mem & mem = op.mem;
-        if(mem.base == X86_REG_RIP)  //rip-relative
-            arg->constant = cp.Address() + (duint)mem.disp + cp.Size();
+        if(mem.base == X86_REG_RIP) //rip-relative
+            arg->constant = cp.Address() + duint(mem.disp) + cp.Size();
         else
-            arg->constant = (duint)mem.disp;
-        duint value;
-        if(!valfromstring(arg->mnemonic, &value, true, true))
-            return;
+            arg->constant = duint(mem.disp);
+#ifdef _WIN64
+        if(mem.segment == X86_REG_GS)
+        {
+            arg->segment = SEG_GS;
+#else //x86
+        if(mem.segment == X86_REG_FS)
+        {
+            arg->segment = SEG_FS;
+#endif
+            value += ThreadGetLocalBase(ThreadGetId(hActiveThread));
+        }
         arg->value = value;
         if(DbgMemIsValidReadPtr(value))
         {
             switch(op.size)
             {
             case 1:
-                DbgMemRead(value, (unsigned char*)&arg->memvalue, 1);
+                MemRead(value, (unsigned char*)&arg->memvalue, 1);
                 break;
             case 2:
-                DbgMemRead(value, (unsigned char*)&arg->memvalue, 2);
+                MemRead(value, (unsigned char*)&arg->memvalue, 2);
                 break;
             case 4:
-                DbgMemRead(value, (unsigned char*)&arg->memvalue, 4);
+                MemRead(value, (unsigned char*)&arg->memvalue, 4);
                 break;
+#ifdef _WIN64
             case 8:
-                DbgMemRead(value, (unsigned char*)&arg->memvalue, 8);
+                MemRead(value, (unsigned char*)&arg->memvalue, 8);
                 break;
+#endif //_WIN64
             }
         }
     }
     break;
+
+    default:
+        break;
     }
 }
 
-void disasmget(unsigned char* buffer, duint addr, DISASM_INSTR* instr)
+void disasmget(Capstone & cp, unsigned char* buffer, duint addr, DISASM_INSTR* instr, bool getregs)
 {
-    if(!DbgIsDebugging())
-    {
-        if(instr)
-            instr->argcount = 0;
-        return;
-    }
     memset(instr, 0, sizeof(DISASM_INSTR));
-    Capstone cp;
-    if(!cp.Disassemble(addr, buffer, MAX_DISASM_BUFFER))
+    cp.Disassemble(addr, buffer, MAX_DISASM_BUFFER);
+    if(trydisasm(buffer, addr, instr, cp.Success() ? cp.Size() : 1))
+        return;
+    if(!cp.Success())
     {
         strcpy_s(instr->instruction, "???");
         instr->instr_size = 1;
@@ -209,10 +210,10 @@ void disasmget(unsigned char* buffer, duint addr, DISASM_INSTR* instr)
         instr->type = instr_normal;
     instr->argcount = cp.x86().op_count <= 3 ? cp.x86().op_count : 3;
     for(int i = 0; i < instr->argcount; i++)
-        HandleCapstoneOperand(cp, i, &instr->arg[i]);
+        HandleCapstoneOperand(cp, i, &instr->arg[i], getregs);
 }
 
-void disasmget(duint addr, DISASM_INSTR* instr)
+void disasmget(Capstone & cp, duint addr, DISASM_INSTR* instr, bool getregs)
 {
     if(!DbgIsDebugging())
     {
@@ -221,21 +222,34 @@ void disasmget(duint addr, DISASM_INSTR* instr)
         return;
     }
     unsigned char buffer[MAX_DISASM_BUFFER] = "";
-    DbgMemRead(addr, buffer, sizeof(buffer));
-    disasmget(buffer, addr, instr);
+    if(MemRead(addr, buffer, sizeof(buffer)))
+        disasmget(cp, buffer, addr, instr, getregs);
+    else
+        memset(instr, 0, sizeof(DISASM_INSTR)); // Buffer overflow
 }
 
-void disasmprint(duint addr)
+void disasmget(unsigned char* buffer, duint addr, DISASM_INSTR* instr, bool getregs)
 {
-    DISASM_INSTR instr;
-    memset(&instr, 0, sizeof(instr));
-    disasmget(addr, &instr);
-    dprintf(">%d:\"%s\":\n", instr.type, instr.instruction);
-    for(int i = 0; i < instr.argcount; i++)
-        dprintf(" %d:%d:%" fext "X:%" fext "X:%" fext "X\n", i, instr.arg[i].type, instr.arg[i].constant, instr.arg[i].value, instr.arg[i].memvalue);
+    Capstone cp;
+    disasmget(cp, buffer, addr, instr, getregs);
 }
 
-static bool isasciistring(const unsigned char* data, int maxlen)
+void disasmget(duint addr, DISASM_INSTR* instr, bool getregs)
+{
+    if(!DbgIsDebugging())
+    {
+        if(instr)
+            instr->argcount = 0;
+        return;
+    }
+    unsigned char buffer[MAX_DISASM_BUFFER] = "";
+    if(MemRead(addr, buffer, sizeof(buffer)))
+        disasmget(buffer, addr, instr, getregs);
+    else
+        memset(instr, 0, sizeof(DISASM_INSTR)); // Buffer overflow
+}
+
+extern "C" __declspec(dllexport) bool isasciistring(const unsigned char* data, int maxlen)
 {
     int len = 0;
     for(char* p = (char*)data; *p; len++, p++)
@@ -252,7 +266,7 @@ static bool isasciistring(const unsigned char* data, int maxlen)
     return true;
 }
 
-static bool isunicodestring(const unsigned char* data, int maxlen)
+extern "C" __declspec(dllexport) bool isunicodestring(const unsigned char* data, int maxlen)
 {
     int len = 0;
     for(wchar_t* p = (wchar_t*)data; *p; len++, p++)
@@ -263,6 +277,7 @@ static bool isunicodestring(const unsigned char* data, int maxlen)
 
     if(len < 2 || len + 1 >= maxlen)
         return false;
+
     for(int i = 0; i < len * 2; i += 2)
     {
         if(data[i + 1]) //Extended ASCII only
@@ -273,16 +288,28 @@ static bool isunicodestring(const unsigned char* data, int maxlen)
     return true;
 }
 
-bool disasmispossiblestring(duint addr)
+bool disasmispossiblestring(duint addr, STRING_TYPE* type)
 {
     unsigned char data[11];
     memset(data, 0, sizeof(data));
-    if(!MemRead(addr, data, sizeof(data) - 3))
+    if(!MemReadUnsafe(addr, data, sizeof(data) - 3))
         return false;
     duint test = 0;
     memcpy(&test, data, sizeof(duint));
-    if(isasciistring(data, sizeof(data)) || isunicodestring(data, _countof(data)))
+    if(isasciistring(data, sizeof(data)))
+    {
+        if(type)
+            *type = str_ascii;
         return true;
+    }
+    if(isunicodestring(data, _countof(data)))
+    {
+        if(type)
+            *type = str_unicode;
+        return true;
+    }
+    if(type)
+        *type = str_none;
     return false;
 }
 
@@ -290,10 +317,10 @@ bool disasmgetstringat(duint addr, STRING_TYPE* type, char* ascii, char* unicode
 {
     if(type)
         *type = str_none;
-    if(!disasmispossiblestring(addr))
+    if(!MemIsValidReadPtrUnsafe(addr, true) || !disasmispossiblestring(addr))
         return false;
     Memory<unsigned char*> data((maxlen + 1) * 2, "disasmgetstringat:data");
-    if(!MemRead(addr, data(), (maxlen + 1) * 2))
+    if(!MemReadUnsafe(addr, data(), (maxlen + 1) * 2)) //TODO: use safe version?
         return false;
 
     // Save a few pointer casts
@@ -322,12 +349,9 @@ bool disasmgetstringat(duint addr, STRING_TYPE* type, char* ascii, char* unicode
         // Determine string length only once, limited to output buffer size
         int unicodeLength = min(int(wcslen(unicodeData)), maxlen);
 
-        // Truncate each wchar_t to char
-        for(int i = 0; i < unicodeLength; i++)
-            asciiData[i] = char(unicodeData[i] & 0xFF);
-
-        // Fix the null terminator (data len = maxlen + 1)
-        asciiData[unicodeLength] = '\0';
+        // Convert UTF-16 string to UTF-8
+        std::string asciiData2 = StringUtils::Utf16ToUtf8((const wchar_t*)data());
+        memcpy(asciiData, asciiData2.c_str(), min((size_t(maxlen) + 1) * 2, asciiData2.size() + 1));
 
         // Escape the string
         String escaped = StringUtils::Escape(asciiData);
@@ -340,12 +364,54 @@ bool disasmgetstringat(duint addr, STRING_TYPE* type, char* ascii, char* unicode
     return false;
 }
 
+bool disasmgetstringatwrapper(duint addr, char* dest, bool cache)
+{
+    if(!MemIsValidReadPtrUnsafe(addr, cache))
+        return false;
+
+    auto readValidPtr = [cache](duint addr) -> duint
+    {
+        duint addrPtr;
+        if(MemReadUnsafe(addr, &addrPtr, sizeof(addrPtr)) && MemIsValidReadPtrUnsafe(addrPtr, cache))
+            return addrPtr;
+        return 0;
+    };
+
+    *dest = '\0';
+    char string[MAX_STRING_SIZE];
+    duint addrPtr = readValidPtr(addr);
+    STRING_TYPE strtype;
+    auto possibleUnicode = disasmispossiblestring(addr, &strtype) && strtype == str_unicode;
+    if(addrPtr && !possibleUnicode)
+    {
+        if(disasmgetstringat(addrPtr, &strtype, string, string, MAX_STRING_SIZE - 5))
+        {
+            if(int(strlen(string)) <= (strtype == str_ascii ? 3 : 2) && readValidPtr(addrPtr))
+                return false;
+            if(strtype == str_ascii)
+                sprintf_s(dest, MAX_STRING_SIZE, "&\"%s\"", string);
+            else //unicode
+                sprintf_s(dest, MAX_STRING_SIZE, "&L\"%s\"", string);
+            return true;
+        }
+    }
+    if(disasmgetstringat(addr, &strtype, string, string, MAX_STRING_SIZE - 4))
+    {
+        if(strtype == str_ascii)
+            sprintf_s(dest, MAX_STRING_SIZE, "\"%s\"", string);
+        else //unicode
+            sprintf_s(dest, MAX_STRING_SIZE, "L\"%s\"", string);
+        return true;
+    }
+    return false;
+}
+
 int disasmgetsize(duint addr, unsigned char* data)
 {
     Capstone cp;
     if(!cp.Disassemble(addr, data, MAX_DISASM_BUFFER))
         return 1;
-    return cp.Size();
+    return int(EncodeMapGetSize(addr, cp.Size()));
 }
 
 int disasmgetsize(duint addr)

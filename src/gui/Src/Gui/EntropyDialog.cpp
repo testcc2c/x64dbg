@@ -6,10 +6,7 @@ EntropyDialog::EntropyDialog(QWidget* parent) :
     ui(new Ui::EntropyDialog)
 {
     ui->setupUi(this);
-#if QT_VERSION < QT_VERSION_CHECK(5,0,0)
-    setWindowFlags(Qt::Dialog | Qt::WindowSystemMenuHint | Qt::WindowTitleHint | Qt::MSWindowsFixedSizeDialogHint);
-#endif
-    setFixedSize(this->size()); //fixed size
+    setWindowFlags(windowFlags() & ~Qt::WindowContextHelpButtonHint | Qt::MSWindowsFixedSizeDialogHint);
 
     mBlockSize = 128;
     mPointCount = 300;

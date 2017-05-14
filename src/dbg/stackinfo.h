@@ -17,7 +17,11 @@ struct CALLSTACK
     CALLSTACKENTRY* entries;
 };
 
+void stackupdateseh();
 bool stackcommentget(duint addr, STACK_COMMENT* comment);
+void stackupdatecallstack(duint csp);
 void stackgetcallstack(duint csp, CALLSTACK* callstack);
+void stackgetcallstack(duint csp, std::vector<CALLSTACKENTRY> & callstack, bool cache);
+void stackupdatesettings();
 
 #endif //_STACKINFO_H

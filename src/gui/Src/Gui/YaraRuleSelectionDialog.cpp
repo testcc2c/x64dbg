@@ -6,15 +6,13 @@
 #include <QDirIterator>
 #include "Imports.h"
 
-YaraRuleSelectionDialog::YaraRuleSelectionDialog(QWidget* parent) :
+YaraRuleSelectionDialog::YaraRuleSelectionDialog(QWidget* parent, const QString & title) :
     QDialog(parent),
     ui(new Ui::YaraRuleSelectionDialog)
 {
     ui->setupUi(this);
-#if QT_VERSION < QT_VERSION_CHECK(5,0,0)
-    setWindowFlags(Qt::Dialog | Qt::WindowSystemMenuHint | Qt::WindowTitleHint | Qt::MSWindowsFixedSizeDialogHint);
-#endif
-    setFixedSize(this->size()); //fixed size
+    setWindowFlags(windowFlags() & ~Qt::WindowContextHelpButtonHint | Qt::MSWindowsFixedSizeDialogHint);
+    setWindowTitle(title);
 
     char setting[MAX_SETTING_SIZE] = "";
     if(BridgeSettingGet("Misc", "YaraRulesDirectory", setting))
@@ -36,7 +34,7 @@ QString YaraRuleSelectionDialog::getSelectedFile()
 
 void YaraRuleSelectionDialog::on_buttonDirectory_clicked()
 {
-    QString dir = QFileDialog::getExistingDirectory(this, "Select Yara Rules Directory...");
+    QString dir = QFileDialog::getExistingDirectory(this, tr("Select Yara Rules Directory..."));
     if(!dir.length())
         return;
     rulesDirectory = QDir::toNativeSeparators(dir);
@@ -46,7 +44,7 @@ void YaraRuleSelectionDialog::on_buttonDirectory_clicked()
 
 void YaraRuleSelectionDialog::on_buttonFile_clicked()
 {
-    QString file = QFileDialog::getOpenFileName(this, "Select Yara Rule...", rulesDirectory);
+    QString file = QFileDialog::getOpenFileName(this, tr("Select Yara Rule..."), rulesDirectory);
     if(!file.length())
         return;
     selectedFile = QDir::toNativeSeparators(file);

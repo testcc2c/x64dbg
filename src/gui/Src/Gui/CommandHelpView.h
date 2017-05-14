@@ -2,12 +2,14 @@
 #define COMMANDHELPVIEW_H
 
 #include <QWidget>
-#include <QVBoxLayout>
-#include "SearchListView.h"
+
+class QVBoxLayout;
+class SearchListView;
+class StdTable;
 
 namespace Ui
 {
-class CommandHelpView;
+    class CommandHelpView;
 }
 
 class CommandHelpView : public QWidget

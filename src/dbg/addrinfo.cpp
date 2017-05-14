@@ -6,20 +6,12 @@
 
 #include "addrinfo.h"
 #include "debugger.h"
-#include "console.h"
 #include "memory.h"
-#include "breakpoint.h"
-#include "lz4\lz4file.h"
-#include "patches.h"
 #include "module.h"
-#include "comment.h"
-#include "label.h"
-#include "bookmark.h"
-#include "function.h"
-#include "loop.h"
+#include "value.h"
 
 ///api functions
-bool apienumexports(duint base, EXPORTENUMCALLBACK cbEnum)
+bool apienumexports(duint base, const EXPORTENUMCALLBACK & cbEnum)
 {
     MEMORY_BASIC_INFORMATION mbi;
     VirtualQueryEx(fdProcessInfo->hProcess, (const void*)base, &mbi, sizeof(mbi));
@@ -73,7 +65,7 @@ bool apienumexports(duint base, EXPORTENUMCALLBACK cbEnum)
                 HINSTANCE hTempDll = LoadLibraryExA(forwarded_api, 0, DONT_RESOLVE_DLL_REFERENCES | LOAD_LIBRARY_AS_DATAFILE);
                 if(hTempDll)
                 {
-                    duint local_addr = (duint)GetProcAddress(hTempDll, forwarded_api + j + 1);
+                    duint local_addr = SafeGetProcAddress(hTempDll, forwarded_api + j + 1);
                     if(local_addr)
                     {
                         duint remote_addr = ImporterGetRemoteAPIAddress(fdProcessInfo->hProcess, local_addr);
@@ -87,5 +79,87 @@ bool apienumexports(duint base, EXPORTENUMCALLBACK cbEnum)
             cbEnum(base, modname, cur_name, curFunctionRva + base);
         }
     }
+    return true;
+}
+
+bool apienumimports(duint base, const IMPORTENUMCALLBACK & cbEnum)
+{
+    // Variables
+    bool readSuccess;
+    Memory<char*> importName(MAX_IMPORT_SIZE + 1, "apienumimports:buffer");
+    char importModuleName[MAX_MODULE_SIZE + 1] = "";
+    duint regionSize;
+    ULONG_PTR importTableRva, importTableSize;
+    MEMORY_BASIC_INFORMATION mbi;
+    PIMAGE_IMPORT_DESCRIPTOR importTableVa;
+    IMAGE_IMPORT_DESCRIPTOR importDescriptor;
+    PIMAGE_THUNK_DATA imageIATVa, imageINTVa;
+    IMAGE_THUNK_DATA imageOftThunkData, imageFtThunkData;
+    PIMAGE_IMPORT_BY_NAME pImageImportByNameVa;
+
+    // Get page size
+    VirtualQueryEx(fdProcessInfo->hProcess, (const void*)base, &mbi, sizeof(mbi));
+    regionSize = mbi.RegionSize;
+    Memory<void*> buffer(regionSize, "apienumimports:buffer");
+
+    // Read first page into buffer
+    if(!MemRead(base, buffer(), regionSize))
+        return false;
+
+    // Import Table address and size
+    importTableRva = GetPE32DataFromMappedFile((duint)buffer(), 0, UE_IMPORTTABLEADDRESS);
+    importTableSize = GetPE32DataFromMappedFile((duint)buffer(), 0, UE_IMPORTTABLESIZE);
+
+    // Return if no imports
+    if(!importTableSize)
+        return false;
+
+    importTableVa = (PIMAGE_IMPORT_DESCRIPTOR)(base + importTableRva);
+
+    readSuccess = MemRead((duint)importTableVa, &importDescriptor, sizeof(importDescriptor));
+
+    // Loop through all dlls
+    while(readSuccess && importDescriptor.FirstThunk)
+    {
+        // Copy module name into importModuleName
+        MemRead((duint)(base + importDescriptor.Name), &importModuleName, MAX_MODULE_SIZE);
+
+        imageIATVa = (PIMAGE_THUNK_DATA)(base + importDescriptor.FirstThunk);
+        imageINTVa = (PIMAGE_THUNK_DATA)(base + importDescriptor.OriginalFirstThunk);
+
+        if(!MemRead((duint)imageIATVa, &imageFtThunkData, sizeof(imageFtThunkData)))
+            return false;
+
+        if(!MemRead((duint)imageINTVa, &imageOftThunkData, sizeof(imageOftThunkData)))
+            return false;
+
+        // Loop through all imported function in this dll
+        while(imageFtThunkData.u1.AddressOfData)
+        {
+            pImageImportByNameVa = (PIMAGE_IMPORT_BY_NAME)(base + imageOftThunkData.u1.AddressOfData);
+
+            // Read every IMPORT_BY_NAME.name
+            duint bytesRead = 0;
+            if(!MemRead((duint)pImageImportByNameVa + sizeof(WORD), importName(), MAX_IMPORT_SIZE, &bytesRead) && !bytesRead)
+                return false;
+
+            // Callback
+            cbEnum(base, (duint)imageIATVa, importName(), importModuleName);
+
+            // Move to next address in the INT
+            imageINTVa++;
+            if(!MemRead((duint)imageINTVa, &imageOftThunkData, sizeof(imageOftThunkData)))
+                return false;
+
+            // Move to next address in the IAT and read it into imageFtThunkData
+            imageIATVa++;
+            if(!MemRead((duint)imageIATVa, &imageFtThunkData, sizeof(imageFtThunkData)))
+                return false;
+        }
+
+        importTableVa++;
+        readSuccess = MemRead((duint)importTableVa, &importDescriptor, sizeof(importDescriptor));
+    }
+
     return true;
 }

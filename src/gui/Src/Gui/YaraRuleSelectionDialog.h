@@ -5,7 +5,7 @@
 
 namespace Ui
 {
-class YaraRuleSelectionDialog;
+    class YaraRuleSelectionDialog;
 }
 
 class YaraRuleSelectionDialog : public QDialog
@@ -13,7 +13,7 @@ class YaraRuleSelectionDialog : public QDialog
     Q_OBJECT
 
 public:
-    explicit YaraRuleSelectionDialog(QWidget* parent = 0);
+    explicit YaraRuleSelectionDialog(QWidget* parent = 0, const QString & title = "Yara");
     ~YaraRuleSelectionDialog();
     QString getSelectedFile();
 

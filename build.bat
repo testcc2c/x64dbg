@@ -9,20 +9,28 @@ if /i "%1"=="x32"	call setenv.bat x32&set type=Configuration=Release;Platform=Wi
 if /i "%1"=="x64"	call setenv.bat x64&set type=Configuration=Release;Platform=x64&goto build
 if /i "%1"=="coverity"	goto coverity
 if /i "%1"=="doxygen"	call setenv.bat doxygen&goto doxygen
-if /i "%1"=="chm"	call setenv.bat chm&goto chm
 
 goto usage
 
 
 :build
 echo Building DBG...
-msbuild.exe x64dbg.sln /m /verbosity:minimal /t:Rebuild /p:%type%
+if "%MAXCORES%"=="" (
+    msbuild.exe x64dbg.sln /m /verbosity:minimal /t:Rebuild /p:%type%
+) else (
+    set CL=/MP%MAXCORES%
+    msbuild.exe x64dbg.sln /m:1 /verbosity:minimal /t:Rebuild /p:%type%
+)
 
 echo Building GUI...
 rmdir /S /Q src\gui_build
 cd src\gui
 qmake x64dbg.pro CONFIG+=release
-jom
+if "%MAXCORES%"=="" (
+    jom
+) else (
+    jom /J %MAXCORES%
+)
 cd ..\..
 goto :restorepath
 
@@ -42,11 +50,6 @@ goto :restorepath
 
 :doxygen
 doxygen
-goto :restorepath
-
-
-:chm
-start /w "" winchm.exe help\x64_dbg.wcp /h
 goto :restorepath
 
 

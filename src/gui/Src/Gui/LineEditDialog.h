@@ -5,7 +5,7 @@
 
 namespace Ui
 {
-class LineEditDialog;
+    class LineEditDialog;
 }
 
 class LineEditDialog : public QDialog
@@ -18,11 +18,14 @@ public:
     QString editText;
     bool bChecked;
     void setText(const QString & text);
+    void setPlaceholderText(const QString & text);
+    void setTextMaxLength(int length);
     void enableCheckBox(bool bEnable);
     void setCheckBox(bool bSet);
     void setCheckBoxText(const QString & text);
     void setCursorPosition(int position);
     void ForceSize(unsigned int size);
+    void selectAllText();
 
 private slots:
     void on_textEdit_textChanged(const QString & arg1);

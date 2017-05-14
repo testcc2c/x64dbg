@@ -8,11 +8,20 @@
 #include "console.h"
 #include "debugger.h"
 #include "threading.h"
+#include "expressionfunctions.h"
+#include "formatfunctions.h"
+#include <algorithm>
+#include <shlwapi.h>
 
 /**
 \brief List of plugins.
 */
 static std::vector<PLUG_DATA> pluginList;
+
+/**
+\brief Saved plugin directory
+*/
+static std::wstring pluginDirectory;
 
 /**
 \brief The current plugin handle.
@@ -22,7 +31,7 @@ static int curPluginHandle = 0;
 /**
 \brief List of plugin callbacks.
 */
-static std::vector<PLUG_CALLBACK> pluginCallbackList;
+static std::vector<PLUG_CALLBACK> pluginCallbackList[CB_LAST];
 
 /**
 \brief List of plugin commands.
@@ -35,15 +44,347 @@ static std::vector<PLUG_COMMAND> pluginCommandList;
 static std::vector<PLUG_MENU> pluginMenuList;
 
 /**
+\brief List of plugin exprfunctions.
+*/
+static std::vector<PLUG_EXPRFUNCTION> pluginExprfunctionList;
+
+/**
+\brief List of plugin formatfunctions.
+*/
+static std::vector<PLUG_FORMATFUNCTION> pluginFormatfunctionList;
+
+/**
+\brief Loads a plugin from the plugin directory.
+\param pluginName Name of the plugin.
+\param loadall true on unload all.
+\return true if it succeeds, false if it fails.
+*/
+bool pluginload(const char* pluginName, bool loadall)
+{
+    //no empty plugin names allowed
+    if(!pluginName)
+        return false;
+
+    char name[MAX_PATH] = "";
+    strncpy_s(name, pluginName, _TRUNCATE);
+    PLUG_DATA pluginData;
+
+    if(!loadall)
+#ifdef _WIN64
+        strncat_s(name, ".dp64", _TRUNCATE);
+#else
+        strncat_s(name, ".dp32", _TRUNCATE);
+#endif
+
+    wchar_t currentDir[deflen] = L"";
+    if(!loadall)
+    {
+        GetCurrentDirectoryW(deflen, currentDir);
+        SetCurrentDirectoryW(pluginDirectory.c_str());
+    }
+    char searchName[deflen] = "";
+#ifdef _WIN64
+    sprintf(searchName, "%s\\%s", StringUtils::Utf16ToUtf8(pluginDirectory.c_str()).c_str(), name);
+#else
+    sprintf(searchName, "%s\\%s", StringUtils::Utf16ToUtf8(pluginDirectory.c_str()).c_str(), name);
+#endif // _WIN64
+
+    //Check to see if this plugin is already loaded
+    if(!loadall)
+    {
+        EXCLUSIVE_ACQUIRE(LockPluginList);
+        for(auto it = pluginList.begin(); it != pluginList.end(); ++it)
+        {
+            if(_stricmp(it->plugname, name) == 0 && it->isLoaded)
+            {
+                dprintf(QT_TRANSLATE_NOOP("DBG", "[PLUGIN] %s already loaded\n"), name);
+                SetCurrentDirectoryW(currentDir);
+                return false;
+            }
+        }
+    }
+
+    //check if the file exists
+    if(!loadall && !PathFileExistsW(StringUtils::Utf8ToUtf16(searchName).c_str()))
+    {
+        dprintf(QT_TRANSLATE_NOOP("DBG", "[PLUGIN] Cannot find plugin: %s\n"), name);
+        return false;
+    }
+
+    //setup plugin data
+    pluginData.initStruct.pluginHandle = curPluginHandle;
+    pluginData.hPlugin = LoadLibraryW(StringUtils::Utf8ToUtf16(searchName).c_str()); //load the plugin library
+    if(!pluginData.hPlugin)
+    {
+        dprintf(QT_TRANSLATE_NOOP("DBG", "[PLUGIN] Failed to load plugin: %s\n"), name);
+        SetCurrentDirectoryW(currentDir);
+        return false;
+    }
+    pluginData.pluginit = (PLUGINIT)GetProcAddress(pluginData.hPlugin, "pluginit");
+    if(!pluginData.pluginit)
+    {
+        dprintf(QT_TRANSLATE_NOOP("DBG", "[PLUGIN] Export \"pluginit\" not found in plugin: %s\n"), name);
+        for(int i = CB_INITDEBUG; i < CB_LAST; i++)
+            pluginunregistercallback(curPluginHandle, CBTYPE(i));
+        FreeLibrary(pluginData.hPlugin);
+        SetCurrentDirectoryW(currentDir);
+        return false;
+    }
+    pluginData.plugstop = (PLUGSTOP)GetProcAddress(pluginData.hPlugin, "plugstop");
+    pluginData.plugsetup = (PLUGSETUP)GetProcAddress(pluginData.hPlugin, "plugsetup");
+
+    strncpy_s(pluginData.plugpath, searchName, MAX_PATH);
+    strncpy_s(pluginData.plugname, name, MAX_PATH);
+
+    //init plugin
+    if(!pluginData.pluginit(&pluginData.initStruct))
+    {
+        dprintf(QT_TRANSLATE_NOOP("DBG", "[PLUGIN] pluginit failed for plugin: %s\n"), name);
+        for(int i = CB_INITDEBUG; i < CB_LAST; i++)
+            pluginunregistercallback(curPluginHandle, CBTYPE(i));
+        FreeLibrary(pluginData.hPlugin);
+        SetCurrentDirectoryW(currentDir);
+        return false;
+    }
+    if(pluginData.initStruct.sdkVersion < PLUG_SDKVERSION) //the plugin SDK is not compatible
+    {
+        dprintf(QT_TRANSLATE_NOOP("DBG", "[PLUGIN] %s is incompatible with this SDK version\n"), pluginData.initStruct.pluginName);
+        for(int i = CB_INITDEBUG; i < CB_LAST; i++)
+            pluginunregistercallback(curPluginHandle, CBTYPE(i));
+        FreeLibrary(pluginData.hPlugin);
+        SetCurrentDirectoryW(currentDir);
+        return false;
+    }
+
+    dprintf(QT_TRANSLATE_NOOP("DBG", "[PLUGIN] %s v%d Loaded!\n"), pluginData.initStruct.pluginName, pluginData.initStruct.pluginVersion);
+
+    //auto-register callbacks for certain export names
+    auto cbPlugin = CBPLUGIN(GetProcAddress(pluginData.hPlugin, "CBALLEVENTS"));
+    if(cbPlugin)
+    {
+        for(int i = CB_INITDEBUG; i < CB_LAST; i++)
+            pluginregistercallback(curPluginHandle, CBTYPE(i), cbPlugin);
+    }
+    auto regExport = [&pluginData](const char* exportname, CBTYPE cbType)
+    {
+        auto cbPlugin = CBPLUGIN(GetProcAddress(pluginData.hPlugin, exportname));
+        if(cbPlugin)
+            pluginregistercallback(curPluginHandle, cbType, cbPlugin);
+    };
+    regExport("CBINITDEBUG", CB_INITDEBUG);
+    regExport("CBSTOPDEBUG", CB_STOPDEBUG);
+    regExport("CBCREATEPROCESS", CB_CREATEPROCESS);
+    regExport("CBEXITPROCESS", CB_EXITPROCESS);
+    regExport("CBCREATETHREAD", CB_CREATETHREAD);
+    regExport("CBEXITTHREAD", CB_EXITTHREAD);
+    regExport("CBSYSTEMBREAKPOINT", CB_SYSTEMBREAKPOINT);
+    regExport("CBLOADDLL", CB_LOADDLL);
+    regExport("CBUNLOADDLL", CB_UNLOADDLL);
+    regExport("CBOUTPUTDEBUGSTRING", CB_OUTPUTDEBUGSTRING);
+    regExport("CBEXCEPTION", CB_EXCEPTION);
+    regExport("CBBREAKPOINT", CB_BREAKPOINT);
+    regExport("CBPAUSEDEBUG", CB_PAUSEDEBUG);
+    regExport("CBRESUMEDEBUG", CB_RESUMEDEBUG);
+    regExport("CBSTEPPED", CB_STEPPED);
+    regExport("CBATTACH", CB_ATTACH);
+    regExport("CBDETACH", CB_DETACH);
+    regExport("CBDEBUGEVENT", CB_DEBUGEVENT);
+    regExport("CBMENUENTRY", CB_MENUENTRY);
+    regExport("CBWINEVENT", CB_WINEVENT);
+    regExport("CBWINEVENTGLOBAL", CB_WINEVENTGLOBAL);
+    regExport("CBLOADDB", CB_LOADDB);
+    regExport("CBSAVEDB", CB_SAVEDB);
+    regExport("CBFILTERSYMBOL", CB_FILTERSYMBOL);
+    regExport("CBTRACEEXECUTE", CB_TRACEEXECUTE);
+    regExport("CBANALYZE", CB_ANALYZE);
+    regExport("CBADDRINFO", CB_ADDRINFO);
+    regExport("CBVALFROMSTRING", CB_VALFROMSTRING);
+    regExport("CBVALTOSTRING", CB_VALTOSTRING);
+
+    SectionLocker<LockPluginMenuList, false> menuLock; //exclusive lock
+
+    //add plugin menu
+    int hNewMenu = GuiMenuAdd(GUI_PLUGIN_MENU, pluginData.initStruct.pluginName);
+    if(hNewMenu == -1)
+    {
+        dprintf(QT_TRANSLATE_NOOP("DBG", "[PLUGIN] GuiMenuAdd(GUI_PLUGIN_MENU) failed for plugin: %s\n"), pluginData.initStruct.pluginName);
+        pluginData.hMenu = -1;
+    }
+    else
+    {
+        PLUG_MENU newMenu;
+        newMenu.hEntryMenu = hNewMenu;
+        newMenu.hEntryPlugin = -1;
+        newMenu.pluginHandle = pluginData.initStruct.pluginHandle;
+        pluginMenuList.push_back(newMenu);
+        pluginData.hMenu = newMenu.hEntryMenu;
+    }
+
+    //add disasm plugin menu
+    hNewMenu = GuiMenuAdd(GUI_DISASM_MENU, pluginData.initStruct.pluginName);
+    if(hNewMenu == -1)
+    {
+        dprintf(QT_TRANSLATE_NOOP("DBG", "[PLUGIN] GuiMenuAdd(GUI_DISASM_MENU) failed for plugin: %s\n"), pluginData.initStruct.pluginName);
+        pluginData.hMenu = -1;
+    }
+    else
+    {
+        PLUG_MENU newMenu;
+        newMenu.hEntryMenu = hNewMenu;
+        newMenu.hEntryPlugin = -1;
+        newMenu.pluginHandle = pluginData.initStruct.pluginHandle;
+        pluginMenuList.push_back(newMenu);
+        pluginData.hMenuDisasm = newMenu.hEntryMenu;
+    }
+
+    //add dump plugin menu
+    hNewMenu = GuiMenuAdd(GUI_DUMP_MENU, pluginData.initStruct.pluginName);
+    if(hNewMenu == -1)
+    {
+        dprintf(QT_TRANSLATE_NOOP("DBG", "[PLUGIN] GuiMenuAdd(GUI_DUMP_MENU) failed for plugin: %s\n"), pluginData.initStruct.pluginName);
+        pluginData.hMenu = -1;
+    }
+    else
+    {
+        PLUG_MENU newMenu;
+        newMenu.hEntryMenu = hNewMenu;
+        newMenu.hEntryPlugin = -1;
+        newMenu.pluginHandle = pluginData.initStruct.pluginHandle;
+        pluginMenuList.push_back(newMenu);
+        pluginData.hMenuDump = newMenu.hEntryMenu;
+    }
+
+    //add stack plugin menu
+    hNewMenu = GuiMenuAdd(GUI_STACK_MENU, pluginData.initStruct.pluginName);
+    if(hNewMenu == -1)
+    {
+        dprintf(QT_TRANSLATE_NOOP("DBG", "[PLUGIN] GuiMenuAdd(GUI_STACK_MENU) failed for plugin: %s\n"), pluginData.initStruct.pluginName);
+        pluginData.hMenu = -1;
+    }
+    else
+    {
+        PLUG_MENU newMenu;
+        newMenu.hEntryMenu = hNewMenu;
+        newMenu.hEntryPlugin = -1;
+        newMenu.pluginHandle = pluginData.initStruct.pluginHandle;
+        pluginMenuList.push_back(newMenu);
+        pluginData.hMenuStack = newMenu.hEntryMenu;
+    }
+    menuLock.Unlock();
+
+    //add the plugin to the list
+    SectionLocker<LockPluginList, false> pluginLock; //exclusive lock
+    pluginList.push_back(pluginData);
+    pluginLock.Unlock();
+
+    //setup plugin
+    if(pluginData.plugsetup)
+    {
+        PLUG_SETUPSTRUCT setupStruct;
+        setupStruct.hwndDlg = GuiGetWindowHandle();
+        setupStruct.hMenu = pluginData.hMenu;
+        setupStruct.hMenuDisasm = pluginData.hMenuDisasm;
+        setupStruct.hMenuDump = pluginData.hMenuDump;
+        setupStruct.hMenuStack = pluginData.hMenuStack;
+        pluginData.plugsetup(&setupStruct);
+    }
+    pluginData.isLoaded = true;
+    curPluginHandle++;
+
+    if(!loadall)
+        SetCurrentDirectoryW(currentDir);
+    return true;
+}
+
+/**
+\brief Unloads a plugin from the plugin directory.
+\param pluginName Name of the plugin.
+\param unloadall true on unload all.
+\return true if it succeeds, false if it fails.
+*/
+bool pluginunload(const char* pluginName, bool unloadall)
+{
+    bool foundPlugin = false;
+    PLUG_DATA currentPlugin;
+    char name[MAX_PATH] = "";
+    strncpy_s(name, pluginName, _TRUNCATE);
+
+    if(!unloadall)
+#ifdef _WIN64
+        strncat_s(name, ".dp64", _TRUNCATE);
+#else
+        strncat_s(name, ".dp32", _TRUNCATE);
+#endif
+
+    {
+        EXCLUSIVE_ACQUIRE(LockPluginList);
+        for(auto it = pluginList.begin(); it != pluginList.end(); ++it)
+        {
+            if(_stricmp(it->plugname, name) == 0)
+            {
+                currentPlugin = *it;
+                foundPlugin = true;
+                break;
+            }
+        }
+    }
+
+    if(foundPlugin)
+    {
+        if(currentPlugin.plugstop)
+            currentPlugin.plugstop();
+        plugincmdunregisterall(currentPlugin.initStruct.pluginHandle);
+        pluginexprfuncunregisterall(currentPlugin.initStruct.pluginHandle);
+
+        //remove the callbacks
+        {
+            EXCLUSIVE_ACQUIRE(LockPluginCallbackList);
+            for(auto & cbList : pluginCallbackList)
+            {
+                for(auto it = cbList.begin(); it != cbList.end();)
+                {
+                    if(it->pluginHandle == currentPlugin.initStruct.pluginHandle)
+                        it = cbList.erase(it);
+                    else
+                        ++it;
+                }
+            }
+        }
+        {
+            EXCLUSIVE_ACQUIRE(LockPluginList);
+            pluginmenuclear(currentPlugin.hMenu);
+
+            //remove from main pluginlist. We do this so unloadall doesn't try to unload an already released plugin
+            auto pbegin = pluginList.begin();
+            auto pend = pluginList.end();
+            auto new_pend = std::remove_if(pbegin, pend, [&](PLUG_DATA & pData)
+            {
+                if(_stricmp(pData.plugname, currentPlugin.plugname) == 0)
+                    return true;
+                return false;
+            });
+            pluginList.erase(new_pend, pluginList.end());
+        }
+
+        FreeLibrary(currentPlugin.hPlugin);
+        dprintf(QT_TRANSLATE_NOOP("DBG", "[PLUGIN] %s unloaded\n"), name);
+        return true;
+    }
+    dprintf(QT_TRANSLATE_NOOP("DBG", "[PLUGIN] %s not found\n"), name);
+    return false;
+}
+
+/**
 \brief Loads plugins from a specified directory.
 \param pluginDir The directory to load plugins from.
 */
-void pluginload(const char* pluginDir)
+void pluginloadall(const char* pluginDir)
 {
     //load new plugins
     wchar_t currentDir[deflen] = L"";
+    pluginDirectory = StringUtils::Utf8ToUtf16(pluginDir);
     GetCurrentDirectoryW(deflen, currentDir);
-    SetCurrentDirectoryW(StringUtils::Utf8ToUtf16(pluginDir).c_str());
+    SetCurrentDirectoryW(pluginDirectory.c_str());
     char searchName[deflen] = "";
 #ifdef _WIN64
     sprintf(searchName, "%s\\*.dp64", pluginDir);
@@ -57,234 +398,29 @@ void pluginload(const char* pluginDir)
         SetCurrentDirectoryW(currentDir);
         return;
     }
-    PLUG_DATA pluginData;
     do
     {
-        //set plugin data
-        pluginData.initStruct.pluginHandle = curPluginHandle;
-        char szPluginPath[MAX_PATH] = "";
-        sprintf_s(szPluginPath, "%s\\%s", pluginDir, StringUtils::Utf16ToUtf8(foundData.cFileName).c_str());
-        pluginData.hPlugin = LoadLibraryW(StringUtils::Utf8ToUtf16(szPluginPath).c_str()); //load the plugin library
-        if(!pluginData.hPlugin)
-        {
-            dprintf("[PLUGIN] Failed to load plugin: %s\n", StringUtils::Utf16ToUtf8(foundData.cFileName).c_str());
-            continue;
-        }
-        pluginData.pluginit = (PLUGINIT)GetProcAddress(pluginData.hPlugin, "pluginit");
-        if(!pluginData.pluginit)
-        {
-            dprintf("[PLUGIN] Export \"pluginit\" not found in plugin: %s\n", StringUtils::Utf16ToUtf8(foundData.cFileName).c_str());
-            FreeLibrary(pluginData.hPlugin);
-            continue;
-        }
-        pluginData.plugstop = (PLUGSTOP)GetProcAddress(pluginData.hPlugin, "plugstop");
-        pluginData.plugsetup = (PLUGSETUP)GetProcAddress(pluginData.hPlugin, "plugsetup");
-
-        //auto-register callbacks for certain export names
-        CBPLUGIN cbPlugin;
-        cbPlugin = (CBPLUGIN)GetProcAddress(pluginData.hPlugin, "CBALLEVENTS");
-        if(cbPlugin)
-        {
-            pluginregistercallback(curPluginHandle, CB_INITDEBUG, cbPlugin);
-            pluginregistercallback(curPluginHandle, CB_STOPDEBUG, cbPlugin);
-            pluginregistercallback(curPluginHandle, CB_CREATEPROCESS, cbPlugin);
-            pluginregistercallback(curPluginHandle, CB_EXITPROCESS, cbPlugin);
-            pluginregistercallback(curPluginHandle, CB_CREATETHREAD, cbPlugin);
-            pluginregistercallback(curPluginHandle, CB_EXITTHREAD, cbPlugin);
-            pluginregistercallback(curPluginHandle, CB_SYSTEMBREAKPOINT, cbPlugin);
-            pluginregistercallback(curPluginHandle, CB_LOADDLL, cbPlugin);
-            pluginregistercallback(curPluginHandle, CB_UNLOADDLL, cbPlugin);
-            pluginregistercallback(curPluginHandle, CB_OUTPUTDEBUGSTRING, cbPlugin);
-            pluginregistercallback(curPluginHandle, CB_EXCEPTION, cbPlugin);
-            pluginregistercallback(curPluginHandle, CB_BREAKPOINT, cbPlugin);
-            pluginregistercallback(curPluginHandle, CB_PAUSEDEBUG, cbPlugin);
-            pluginregistercallback(curPluginHandle, CB_RESUMEDEBUG, cbPlugin);
-            pluginregistercallback(curPluginHandle, CB_STEPPED, cbPlugin);
-            pluginregistercallback(curPluginHandle, CB_ATTACH, cbPlugin);
-            pluginregistercallback(curPluginHandle, CB_DETACH, cbPlugin);
-            pluginregistercallback(curPluginHandle, CB_DEBUGEVENT, cbPlugin);
-            pluginregistercallback(curPluginHandle, CB_MENUENTRY, cbPlugin);
-            pluginregistercallback(curPluginHandle, CB_WINEVENT, cbPlugin);
-            pluginregistercallback(curPluginHandle, CB_WINEVENTGLOBAL, cbPlugin);
-        }
-        cbPlugin = (CBPLUGIN)GetProcAddress(pluginData.hPlugin, "CBINITDEBUG");
-        if(cbPlugin)
-            pluginregistercallback(curPluginHandle, CB_INITDEBUG, cbPlugin);
-        cbPlugin = (CBPLUGIN)GetProcAddress(pluginData.hPlugin, "CBSTOPDEBUG");
-        if(cbPlugin)
-            pluginregistercallback(curPluginHandle, CB_STOPDEBUG, cbPlugin);
-        cbPlugin = (CBPLUGIN)GetProcAddress(pluginData.hPlugin, "CBCREATEPROCESS");
-        if(cbPlugin)
-            pluginregistercallback(curPluginHandle, CB_CREATEPROCESS, cbPlugin);
-        cbPlugin = (CBPLUGIN)GetProcAddress(pluginData.hPlugin, "CBEXITPROCESS");
-        if(cbPlugin)
-            pluginregistercallback(curPluginHandle, CB_EXITPROCESS, cbPlugin);
-        cbPlugin = (CBPLUGIN)GetProcAddress(pluginData.hPlugin, "CBCREATETHREAD");
-        if(cbPlugin)
-            pluginregistercallback(curPluginHandle, CB_CREATETHREAD, cbPlugin);
-        cbPlugin = (CBPLUGIN)GetProcAddress(pluginData.hPlugin, "CBEXITTHREAD");
-        if(cbPlugin)
-            pluginregistercallback(curPluginHandle, CB_EXITTHREAD, cbPlugin);
-        cbPlugin = (CBPLUGIN)GetProcAddress(pluginData.hPlugin, "CBSYSTEMBREAKPOINT");
-        if(cbPlugin)
-            pluginregistercallback(curPluginHandle, CB_SYSTEMBREAKPOINT, cbPlugin);
-        cbPlugin = (CBPLUGIN)GetProcAddress(pluginData.hPlugin, "CBLOADDLL");
-        if(cbPlugin)
-            pluginregistercallback(curPluginHandle, CB_LOADDLL, cbPlugin);
-        cbPlugin = (CBPLUGIN)GetProcAddress(pluginData.hPlugin, "CBUNLOADDLL");
-        if(cbPlugin)
-            pluginregistercallback(curPluginHandle, CB_UNLOADDLL, cbPlugin);
-        cbPlugin = (CBPLUGIN)GetProcAddress(pluginData.hPlugin, "CBOUTPUTDEBUGSTRING");
-        if(cbPlugin)
-            pluginregistercallback(curPluginHandle, CB_OUTPUTDEBUGSTRING, cbPlugin);
-        cbPlugin = (CBPLUGIN)GetProcAddress(pluginData.hPlugin, "CBEXCEPTION");
-        if(cbPlugin)
-            pluginregistercallback(curPluginHandle, CB_EXCEPTION, cbPlugin);
-        cbPlugin = (CBPLUGIN)GetProcAddress(pluginData.hPlugin, "CBBREAKPOINT");
-        if(cbPlugin)
-            pluginregistercallback(curPluginHandle, CB_BREAKPOINT, cbPlugin);
-        cbPlugin = (CBPLUGIN)GetProcAddress(pluginData.hPlugin, "CBPAUSEDEBUG");
-        if(cbPlugin)
-            pluginregistercallback(curPluginHandle, CB_PAUSEDEBUG, cbPlugin);
-        cbPlugin = (CBPLUGIN)GetProcAddress(pluginData.hPlugin, "CBRESUMEDEBUG");
-        if(cbPlugin)
-            pluginregistercallback(curPluginHandle, CB_RESUMEDEBUG, cbPlugin);
-        cbPlugin = (CBPLUGIN)GetProcAddress(pluginData.hPlugin, "CBSTEPPED");
-        if(cbPlugin)
-            pluginregistercallback(curPluginHandle, CB_STEPPED, cbPlugin);
-        cbPlugin = (CBPLUGIN)GetProcAddress(pluginData.hPlugin, "CBATTACH");
-        if(cbPlugin)
-            pluginregistercallback(curPluginHandle, CB_ATTACH, cbPlugin);
-        cbPlugin = (CBPLUGIN)GetProcAddress(pluginData.hPlugin, "CBDETACH");
-        if(cbPlugin)
-            pluginregistercallback(curPluginHandle, CB_DETACH, cbPlugin);
-        cbPlugin = (CBPLUGIN)GetProcAddress(pluginData.hPlugin, "CBDEBUGEVENT");
-        if(cbPlugin)
-            pluginregistercallback(curPluginHandle, CB_DEBUGEVENT, cbPlugin);
-        cbPlugin = (CBPLUGIN)GetProcAddress(pluginData.hPlugin, "CBMENUENTRY");
-        if(cbPlugin)
-            pluginregistercallback(curPluginHandle, CB_MENUENTRY, cbPlugin);
-        cbPlugin = (CBPLUGIN)GetProcAddress(pluginData.hPlugin, "CBWINEVENT");
-        if(cbPlugin)
-            pluginregistercallback(curPluginHandle, CB_WINEVENT, cbPlugin);
-        cbPlugin = (CBPLUGIN)GetProcAddress(pluginData.hPlugin, "CBWINEVENTGLOBAL");
-        if(cbPlugin)
-            pluginregistercallback(curPluginHandle, CB_WINEVENTGLOBAL, cbPlugin);
-
-        //init plugin
-        if(!pluginData.pluginit(&pluginData.initStruct))
-        {
-            dprintf("[PLUGIN] pluginit failed for plugin: %s\n", foundData.cFileName);
-            FreeLibrary(pluginData.hPlugin);
-            continue;
-        }
-        else if(pluginData.initStruct.sdkVersion < PLUG_SDKVERSION) //the plugin SDK is not compatible
-        {
-            dprintf("[PLUGIN] %s is incompatible with this SDK version\n", pluginData.initStruct.pluginName);
-            FreeLibrary(pluginData.hPlugin);
-            continue;
-        }
-        else
-            dprintf("[PLUGIN] %s v%d Loaded!\n", pluginData.initStruct.pluginName, pluginData.initStruct.pluginVersion);
-
-        SectionLocker<LockPluginMenuList, false> menuLock; //exclusive lock
-
-        //add plugin menu
-        int hNewMenu = GuiMenuAdd(GUI_PLUGIN_MENU, pluginData.initStruct.pluginName);
-        if(hNewMenu == -1)
-        {
-            dprintf("[PLUGIN] GuiMenuAdd(GUI_PLUGIN_MENU) failed for plugin: %s\n", pluginData.initStruct.pluginName);
-            pluginData.hMenu = -1;
-        }
-        else
-        {
-            PLUG_MENU newMenu;
-            newMenu.hEntryMenu = hNewMenu;
-            newMenu.hEntryPlugin = -1;
-            newMenu.pluginHandle = pluginData.initStruct.pluginHandle;
-            pluginMenuList.push_back(newMenu);
-            pluginData.hMenu = newMenu.hEntryMenu;
-        }
-
-        //add disasm plugin menu
-        hNewMenu = GuiMenuAdd(GUI_DISASM_MENU, pluginData.initStruct.pluginName);
-        if(hNewMenu == -1)
-        {
-            dprintf("[PLUGIN] GuiMenuAdd(GUI_DISASM_MENU) failed for plugin: %s\n", pluginData.initStruct.pluginName);
-            pluginData.hMenu = -1;
-        }
-        else
-        {
-            PLUG_MENU newMenu;
-            newMenu.hEntryMenu = hNewMenu;
-            newMenu.hEntryPlugin = -1;
-            newMenu.pluginHandle = pluginData.initStruct.pluginHandle;
-            pluginMenuList.push_back(newMenu);
-            pluginData.hMenuDisasm = newMenu.hEntryMenu;
-        }
-
-        //add dump plugin menu
-        hNewMenu = GuiMenuAdd(GUI_DUMP_MENU, pluginData.initStruct.pluginName);
-        if(hNewMenu == -1)
-        {
-            dprintf("[PLUGIN] GuiMenuAdd(GUI_DUMP_MENU) failed for plugin: %s\n", pluginData.initStruct.pluginName);
-            pluginData.hMenu = -1;
-        }
-        else
-        {
-            PLUG_MENU newMenu;
-            newMenu.hEntryMenu = hNewMenu;
-            newMenu.hEntryPlugin = -1;
-            newMenu.pluginHandle = pluginData.initStruct.pluginHandle;
-            pluginMenuList.push_back(newMenu);
-            pluginData.hMenuDump = newMenu.hEntryMenu;
-        }
-
-        //add stack plugin menu
-        hNewMenu = GuiMenuAdd(GUI_STACK_MENU, pluginData.initStruct.pluginName);
-        if(hNewMenu == -1)
-        {
-            dprintf("[PLUGIN] GuiMenuAdd(GUI_STACK_MENU) failed for plugin: %s\n", pluginData.initStruct.pluginName);
-            pluginData.hMenu = -1;
-        }
-        else
-        {
-            PLUG_MENU newMenu;
-            newMenu.hEntryMenu = hNewMenu;
-            newMenu.hEntryPlugin = -1;
-            newMenu.pluginHandle = pluginData.initStruct.pluginHandle;
-            pluginMenuList.push_back(newMenu);
-            pluginData.hMenuStack = newMenu.hEntryMenu;
-        }
-        menuLock.Unlock();
-
-        //add the plugin to the list
-        SectionLocker<LockPluginList, false> pluginLock; //exclusive lock
-        pluginList.push_back(pluginData);
-        pluginLock.Unlock();
-
-        //setup plugin
-        if(pluginData.plugsetup)
-        {
-            PLUG_SETUPSTRUCT setupStruct;
-            setupStruct.hwndDlg = GuiGetWindowHandle();
-            setupStruct.hMenu = pluginData.hMenu;
-            setupStruct.hMenuDisasm = pluginData.hMenuDisasm;
-            setupStruct.hMenuDump = pluginData.hMenuDump;
-            setupStruct.hMenuStack = pluginData.hMenuStack;
-            pluginData.plugsetup(&setupStruct);
-        }
-        curPluginHandle++;
+        pluginload(StringUtils::Utf16ToUtf8(foundData.cFileName).c_str(), true);
     }
     while(FindNextFileW(hSearch, &foundData));
     SetCurrentDirectoryW(currentDir);
 }
 
 /**
+\brief Unloads all plugins.
+*/
+void pluginunloadall()
+{
+    EXCLUSIVE_ACQUIRE(LockPluginList);
+    for(const auto & plugin : pluginList)
+        pluginunload(plugin.plugname, true);
+}
+
+/**
 \brief Unregister all plugin commands.
 \param pluginHandle Handle of the plugin to remove the commands from.
 */
-static void plugincmdunregisterall(int pluginHandle)
+void plugincmdunregisterall(int pluginHandle)
 {
     SHARED_ACQUIRE(LockPluginCommandList);
     auto commandList = pluginCommandList; //copy for thread-safety reasons
@@ -304,34 +440,26 @@ static void plugincmdunregisterall(int pluginHandle)
 }
 
 /**
-\brief Unloads all plugins.
+\brief Unregister all plugin expression functions.
+\param pluginHandle Handle of the plugin to remove the commands from.
 */
-void pluginunload()
+void pluginexprfuncunregisterall(int pluginHandle)
 {
+    SHARED_ACQUIRE(LockPluginExprfunctionList);
+    auto commandList = pluginExprfunctionList; //copy for thread-safety reasons
+    SHARED_RELEASE();
+    auto i = commandList.begin();
+    while(i != commandList.end())
     {
-        EXCLUSIVE_ACQUIRE(LockPluginList);
-        for(const auto & currentPlugin : pluginList)  //call plugin stop & unregister all plugin commands
+        auto currentExprfunction = *i;
+        if(currentExprfunction.pluginHandle == pluginHandle)
         {
-            PLUGSTOP stop = currentPlugin.plugstop;
-            if(stop)
-                stop();
-            plugincmdunregisterall(currentPlugin.initStruct.pluginHandle);
+            i = commandList.erase(i);
+            ExpressionFunctions::Unregister(currentExprfunction.name);
         }
+        else
+            ++i;
     }
-    {
-        EXCLUSIVE_ACQUIRE(LockPluginCallbackList);
-        pluginCallbackList.clear(); //remove all callbacks
-    }
-    {
-        EXCLUSIVE_ACQUIRE(LockPluginMenuList);
-        pluginMenuList.clear(); //clear menu list
-    }
-    {
-        EXCLUSIVE_ACQUIRE(LockPluginList);
-        for(const auto & currentPlugin : pluginList)  //free the libraries
-            FreeLibrary(currentPlugin.hPlugin);
-    }
-    GuiMenuClear(GUI_PLUGIN_MENU); //clear the plugin menu
 }
 
 /**
@@ -348,7 +476,7 @@ void pluginregistercallback(int pluginHandle, CBTYPE cbType, CBPLUGIN cbPlugin)
     cbStruct.cbType = cbType;
     cbStruct.cbPlugin = cbPlugin;
     EXCLUSIVE_ACQUIRE(LockPluginCallbackList);
-    pluginCallbackList.push_back(cbStruct);
+    pluginCallbackList[cbType].push_back(cbStruct);
 }
 
 /**
@@ -359,14 +487,16 @@ void pluginregistercallback(int pluginHandle, CBTYPE cbType, CBPLUGIN cbPlugin)
 bool pluginunregistercallback(int pluginHandle, CBTYPE cbType)
 {
     EXCLUSIVE_ACQUIRE(LockPluginCallbackList);
-    for(auto it = pluginCallbackList.begin(); it != pluginCallbackList.end(); ++it)
+    auto & cbList = pluginCallbackList[cbType];
+    for(auto it = cbList.begin(); it != cbList.end();)
     {
-        const auto & currentCallback = *it;
-        if(currentCallback.pluginHandle == pluginHandle && currentCallback.cbType == cbType)
+        if(it->pluginHandle == pluginHandle)
         {
-            pluginCallbackList.erase(it);
+            cbList.erase(it);
             return true;
         }
+        else
+            ++it;
     }
     return false;
 }
@@ -378,18 +508,23 @@ bool pluginunregistercallback(int pluginHandle, CBTYPE cbType)
 */
 void plugincbcall(CBTYPE cbType, void* callbackInfo)
 {
+    if(pluginCallbackList[cbType].empty())
+        return;
     SHARED_ACQUIRE(LockPluginCallbackList);
-    auto callbackList = pluginCallbackList; //copy for thread-safety reasons
+    auto cbList = pluginCallbackList[cbType]; //copy for thread-safety reasons
     SHARED_RELEASE();
-    for(const auto & currentCallback : callbackList)
-    {
-        if(currentCallback.cbType == cbType)
-        {
-            CBPLUGIN cbPlugin = currentCallback.cbPlugin;
-            if(!IsBadReadPtr((const void*)cbPlugin, sizeof(duint)))
-                cbPlugin(cbType, callbackInfo);
-        }
-    }
+    for(const auto & currentCallback : cbList)
+        currentCallback.cbPlugin(cbType, callbackInfo);
+}
+
+/**
+\brief Checks if any callbacks are registered
+\param cbType The type of the callback.
+\return true if no callbacks are registered.
+*/
+bool plugincbempty(CBTYPE cbType)
+{
+    return pluginCallbackList[cbType].empty();
 }
 
 /**
@@ -412,7 +547,7 @@ bool plugincmdregister(int pluginHandle, const char* command, CBPLUGINCOMMAND cb
     EXCLUSIVE_ACQUIRE(LockPluginCommandList);
     pluginCommandList.push_back(plugCmd);
     EXCLUSIVE_RELEASE();
-    dprintf("[PLUGIN] command \"%s\" registered!\n", command);
+    dprintf(QT_TRANSLATE_NOOP("DBG", "[PLUGIN] Command \"%s\" registered!\n"), command);
     return true;
 }
 
@@ -436,7 +571,7 @@ bool plugincmdunregister(int pluginHandle, const char* command)
             EXCLUSIVE_RELEASE();
             if(!dbgcmddel(command))
                 return false;
-            dprintf("[PLUGIN] command \"%s\" unregistered!\n", command);
+            dprintf(QT_TRANSLATE_NOOP("DBG", "[PLUGIN] Command \"%s\" unregistered!\n"), command);
             return true;
         }
     }
@@ -576,16 +711,15 @@ void pluginmenucall(int hEntry)
             PLUG_CB_MENUENTRY menuEntryInfo;
             menuEntryInfo.hEntry = currentMenu.hEntryPlugin;
             SectionLocker<LockPluginCallbackList, true> callbackLock; //shared lock
-            auto j = pluginCallbackList.begin();
-            while(j != pluginCallbackList.end())
+            const auto & cbList = pluginCallbackList[CB_MENUENTRY];
+            for(auto j = cbList.begin(); j != cbList.end();)
             {
-                const auto currentCallback = *j;
-                ++j;
-                if(currentCallback.pluginHandle == currentMenu.pluginHandle && currentCallback.cbType == CB_MENUENTRY)
+                auto currentCallback = *j++;
+                if(currentCallback.pluginHandle == currentMenu.pluginHandle)
                 {
                     menuLock.Unlock();
                     callbackLock.Unlock();
-                    currentCallback.cbPlugin(CB_MENUENTRY, &menuEntryInfo);
+                    currentCallback.cbPlugin(currentCallback.cbType, &menuEntryInfo);
                     return;
                 }
             }
@@ -604,7 +738,7 @@ bool pluginwinevent(MSG* message, long* result)
     PLUG_CB_WINEVENT winevent;
     winevent.message = message;
     winevent.result = result;
-    winevent.retval = false;
+    winevent.retval = false; //false=handle event, true=ignore event
     plugincbcall(CB_WINEVENT, &winevent);
     return winevent.retval;
 }
@@ -618,7 +752,7 @@ bool pluginwineventglobal(MSG* message)
 {
     PLUG_CB_WINEVENTGLOBAL winevent;
     winevent.message = message;
-    winevent.retval = false;
+    winevent.retval = false; //false=handle event, true=ignore event
     plugincbcall(CB_WINEVENTGLOBAL, &winevent);
     return winevent.retval;
 }
@@ -660,4 +794,169 @@ void pluginmenuentryseticon(int pluginHandle, int hEntry, const ICONDATA* icon)
             break;
         }
     }
+}
+
+void pluginmenuentrysetchecked(int pluginHandle, int hEntry, bool checked)
+{
+    if(hEntry == -1)
+        return;
+    SHARED_ACQUIRE(LockPluginMenuList);
+    for(const auto & currentMenu : pluginMenuList)
+    {
+        if(currentMenu.pluginHandle == pluginHandle && currentMenu.hEntryPlugin == hEntry)
+        {
+            GuiMenuSetEntryChecked(currentMenu.hEntryMenu, checked);
+            break;
+        }
+    }
+}
+
+void pluginmenusetvisible(int pluginHandle, int hMenu, bool visible)
+{
+    SHARED_ACQUIRE(LockPluginMenuList);
+    for(const auto & currentMenu : pluginMenuList)
+    {
+        if(currentMenu.hEntryMenu == hMenu && currentMenu.hEntryPlugin == -1)
+        {
+            GuiMenuSetVisible(hMenu, visible);
+            break;
+        }
+    }
+}
+
+void pluginmenuentrysetvisible(int pluginHandle, int hEntry, bool visible)
+{
+    if(hEntry == -1)
+        return;
+    SHARED_ACQUIRE(LockPluginMenuList);
+    for(const auto & currentMenu : pluginMenuList)
+    {
+        if(currentMenu.pluginHandle == pluginHandle && currentMenu.hEntryPlugin == hEntry)
+        {
+            GuiMenuSetEntryChecked(currentMenu.hEntryMenu, visible);
+            break;
+        }
+    }
+}
+
+void pluginmenusetname(int pluginHandle, int hMenu, const char* name)
+{
+    if(!name)
+        return;
+    SHARED_ACQUIRE(LockPluginMenuList);
+    for(const auto & currentMenu : pluginMenuList)
+    {
+        if(currentMenu.hEntryMenu == hMenu && currentMenu.hEntryPlugin == -1)
+        {
+            GuiMenuSetName(hMenu, name);
+            break;
+        }
+    }
+}
+
+void pluginmenuentrysetname(int pluginHandle, int hEntry, const char* name)
+{
+    if(hEntry == -1 || !name)
+        return;
+    SHARED_ACQUIRE(LockPluginMenuList);
+    for(const auto & currentMenu : pluginMenuList)
+    {
+        if(currentMenu.pluginHandle == pluginHandle && currentMenu.hEntryPlugin == hEntry)
+        {
+            GuiMenuSetEntryName(currentMenu.hEntryMenu, name);
+            break;
+        }
+    }
+}
+
+void pluginmenuentrysethotkey(int pluginHandle, int hEntry, const char* hotkey)
+{
+    if(hEntry == -1 || !hotkey)
+        return;
+    SHARED_ACQUIRE(LockPluginMenuList);
+    for(const auto & currentMenu : pluginMenuList)
+    {
+        if(currentMenu.pluginHandle == pluginHandle && currentMenu.hEntryPlugin == hEntry)
+        {
+            for(const auto & plugin : pluginList)
+            {
+                if(plugin.initStruct.pluginHandle == pluginHandle)
+                {
+                    char name[MAX_PATH] = "";
+                    strcpy_s(name, plugin.plugname);
+                    *strrchr(name, '.') = '\0';
+                    auto hack = StringUtils::sprintf("%s\1%s_%d", hotkey, name, hEntry);
+                    GuiMenuSetEntryHotkey(currentMenu.hEntryMenu, hack.c_str());
+                    break;
+                }
+            }
+            break;
+        }
+    }
+}
+
+bool pluginexprfuncregister(int pluginHandle, const char* name, int argc, CBPLUGINEXPRFUNCTION cbFunction, void* userdata)
+{
+    PLUG_EXPRFUNCTION plugExprfunction;
+    plugExprfunction.pluginHandle = pluginHandle;
+    strcpy_s(plugExprfunction.name, name);
+    if(!ExpressionFunctions::Register(name, argc, cbFunction, userdata))
+        return false;
+    EXCLUSIVE_ACQUIRE(LockPluginExprfunctionList);
+    pluginExprfunctionList.push_back(plugExprfunction);
+    EXCLUSIVE_RELEASE();
+    dprintf(QT_TRANSLATE_NOOP("DBG", "[PLUGIN] Expression function \"%s\" registered!\n"), name);
+    return true;
+}
+
+bool pluginexprfuncunregister(int pluginHandle, const char* name)
+{
+    EXCLUSIVE_ACQUIRE(LockPluginExprfunctionList);
+    for(auto it = pluginExprfunctionList.begin(); it != pluginExprfunctionList.end(); ++it)
+    {
+        const auto & currentExprfunction = *it;
+        if(currentExprfunction.pluginHandle == pluginHandle && !strcmp(currentExprfunction.name, name))
+        {
+            pluginExprfunctionList.erase(it);
+            EXCLUSIVE_RELEASE();
+            if(!ExpressionFunctions::Unregister(name))
+                return false;
+            dprintf(QT_TRANSLATE_NOOP("DBG", "[PLUGIN] Expression function \"%s\" unregistered!\n"), name);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool pluginformatfuncregister(int pluginHandle, const char* type, CBPLUGINFORMATFUNCTION cbFunction, void* userdata)
+{
+    PLUG_FORMATFUNCTION plugFormatfunction;
+    plugFormatfunction.pluginHandle = pluginHandle;
+    strcpy_s(plugFormatfunction.name, type);
+    if(!FormatFunctions::Register(type, cbFunction, userdata))
+        return false;
+    EXCLUSIVE_ACQUIRE(LockPluginFormatfunctionList);
+    pluginFormatfunctionList.push_back(plugFormatfunction);
+    EXCLUSIVE_RELEASE();
+    dprintf(QT_TRANSLATE_NOOP("DBG", "[PLUGIN] Format function \"%s\" registered!\n"), type);
+    return true;
+}
+
+bool pluginformatfuncunregister(int pluginHandle, const char* type)
+{
+    EXCLUSIVE_ACQUIRE(LockPluginFormatfunctionList);
+    for(auto it = pluginFormatfunctionList.begin(); it != pluginFormatfunctionList.end(); ++it)
+    {
+        const auto & currentFormatfunction = *it;
+        if(currentFormatfunction.pluginHandle == pluginHandle && !strcmp(currentFormatfunction.name, type))
+        {
+            pluginFormatfunctionList.erase(it);
+            EXCLUSIVE_RELEASE();
+            if(!FormatFunctions::Unregister(type))
+                return false;
+            dprintf(QT_TRANSLATE_NOOP("DBG", "[PLUGIN] Format function \"%s\" unregistered!\n"), type);
+            return true;
+        }
+    }
+    return false;
 }
